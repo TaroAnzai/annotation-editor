@@ -30,10 +30,86 @@ afterEach(()=>{cleanup();vi.unstubAllGlobals()})
 async function opened(){const view=render(<App/>);await waitFor(()=>expect(view.getByText('sample')).toBeTruthy());fireEvent.click(view.getByText('sample'));await waitFor(()=>expect(view.getByText('1.jpg')).toBeTruthy());return view}
 
 describe('image editing workflow',()=>{
+ it('keeps BBOX labels readable at a fixed screen size while zooming',async()=>{
+  const view=render(<App/>);await waitFor(()=>expect(view.getByText('sample')).toBeTruthy())
+  const stage=view.container.querySelector<HTMLElement>('.stage')!
+  vi.spyOn(stage,'getBoundingClientRect').mockReturnValue({width:50,height:50} as DOMRect)
+  fireEvent.resize(window)
+  fireEvent.click(view.getByText('sample'));await waitFor(()=>expect(view.getByText('1.jpg')).toBeTruthy())
+  const svg=stage.querySelector<SVGSVGElement>('svg')!
+  const assertLabelSize=()=>{
+   const visibleWidth=Number(svg.getAttribute('viewBox')!.split(' ')[2])
+   const text=svg.querySelector('g text')!,background=svg.querySelectorAll('g rect')[1]
+   expect(Number(text.getAttribute('font-size'))*50/visibleWidth).toBeCloseTo(20)
+   expect(Number(background.getAttribute('height'))*50/visibleWidth).toBeCloseTo(30)
+  }
+  assertLabelSize()
+  fireEvent.wheel(svg,{deltaY:-100,clientX:30,clientY:30})
+  assertLabelSize()
+ })
+ it('starts zoomed in while keeping the annotation visible',async()=>{
+  const view=render(<App/>);await waitFor(()=>expect(view.getByText('sample')).toBeTruthy())
+  const stage=view.container.querySelector<HTMLElement>('.stage')!
+  vi.spyOn(stage,'getBoundingClientRect').mockReturnValue({width:100,height:200} as DOMRect)
+  fireEvent.resize(window)
+  fireEvent.click(view.getByText('sample'));await waitFor(()=>expect(view.getByText('1.jpg')).toBeTruthy())
+  const [x,y,width,height]=view.container.querySelector('.stage svg')!.getAttribute('viewBox')!.split(' ').map(Number)
+  expect(width).toBeCloseTo(20.8)
+  expect(height).toBeCloseTo(41.6)
+  expect(x).toBeLessThanOrEqual(20)
+  expect(x+width).toBeGreaterThanOrEqual(40)
+  expect(y).toBeLessThanOrEqual(30)
+  expect(y+height).toBeGreaterThanOrEqual(60)
+ })
+ it('resizes the tile palette by dragging the divider',async()=>{
+  const view=await opened();const inspector=view.container.querySelector<HTMLElement>('.inspector')!;
+  const palette=inspector.querySelector<HTMLElement>('.palette-panel')!;
+  const divider=inspector.querySelector<HTMLElement>('.inspector-splitter')!;
+  vi.spyOn(inspector,'getBoundingClientRect').mockReturnValue({height:500} as DOMRect)
+  vi.spyOn(palette,'getBoundingClientRect').mockReturnValue({height:300} as DOMRect)
+  fireEvent.pointerDown(divider,{clientY:100})
+  fireEvent.pointerMove(window,{clientY:150})
+  expect(palette.style.height).toBe('70%')
+  fireEvent.pointerMove(window,{clientY:1000})
+  expect(parseFloat(palette.style.height)).toBeCloseTo(76.8)
+  fireEvent.pointerUp(window)
+ })
+ it('pans the zoomed image when dragging empty space',async()=>{
+  const view=await opened(),svg=view.container.querySelector<SVGSVGElement>('.stage svg')!
+  vi.spyOn(svg,'getBoundingClientRect').mockReturnValue({width:100,height:100} as DOMRect)
+  const startX=Number(svg.getAttribute('viewBox')!.split(' ')[0])
+  fireEvent.pointerDown(svg,{button:0,clientX:50,clientY:50,pointerId:1})
+  fireEvent.pointerMove(svg,{clientX:70,clientY:50,pointerId:1})
+  fireEvent.pointerUp(svg,{clientX:70,clientY:50,pointerId:1})
+  expect(Number(svg.getAttribute('viewBox')!.split(' ')[0])).toBeLessThan(startX)
+  expect(view.container.querySelectorAll('.annotation-row')).toHaveLength(1)
+  expect(view.getByText('保存').closest('button')?.hasAttribute('disabled')).toBe(true)
+ })
+ it('creates one box in creation mode and returns to panning',async()=>{
+  const view=await opened(),svg=view.container.querySelector<SVGSVGElement>('.stage svg')!
+  const button=view.getByText('＋ BBOX作成')
+  fireEvent.click(button)
+  expect(button.getAttribute('aria-pressed')).toBe('true')
+  fireEvent.pointerDown(svg.querySelector('g rect')!,{button:0,clientX:50,clientY:50,pointerId:1})
+  fireEvent.pointerMove(svg,{clientX:60,clientY:65,pointerId:1})
+  fireEvent.pointerUp(svg,{clientX:60,clientY:65,pointerId:1})
+  expect(view.container.querySelectorAll('.annotation-row')).toHaveLength(2)
+  expect(view.getByText('＋ BBOX作成').getAttribute('aria-pressed')).toBe('false')
+  vi.spyOn(svg,'getBoundingClientRect').mockReturnValue({width:100,height:100} as DOMRect)
+  fireEvent.pointerDown(svg,{button:0,clientX:50,clientY:50,pointerId:2})
+  fireEvent.pointerMove(svg,{clientX:55,clientY:55,pointerId:2})
+  fireEvent.pointerUp(svg,{clientX:55,clientY:55,pointerId:2})
+  expect(view.container.querySelectorAll('.annotation-row')).toHaveLength(2)
+ })
  it('selects and moves a box on the SVG image',async()=>{
   const view=await opened();const svg=view.container.querySelector('.stage svg')!;const rect=svg.querySelector('g rect')!;
+  const list=view.container.querySelector<HTMLElement>('.annotation-list')!;
+  const row=list.querySelector<HTMLElement>('.annotation-row')!;
+  vi.spyOn(list,'getBoundingClientRect').mockReturnValue({top:100,bottom:200} as DOMRect)
+  vi.spyOn(row,'getBoundingClientRect').mockReturnValue({top:230,bottom:258} as DOMRect)
   fireEvent.pointerDown(rect,{clientX:25,clientY:35,pointerId:1});fireEvent.pointerUp(svg,{clientX:25,clientY:35,pointerId:1});
   expect(view.container.querySelector('.annotation-row.selected')).toBeTruthy();
+  expect(list.scrollTop).toBe(58)
   fireEvent.pointerDown(rect,{clientX:25,clientY:35,pointerId:1});fireEvent.pointerMove(svg,{clientX:35,clientY:45,pointerId:1});fireEvent.pointerUp(svg,{clientX:35,clientY:45,pointerId:1});
   expect(Number(svg.querySelector('g rect')?.getAttribute('x'))).toBeCloseTo(30);
  })
