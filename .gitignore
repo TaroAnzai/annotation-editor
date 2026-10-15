@@ -1,0 +1,26 @@
+# Local dataset and annotation work files
+/data/
+/backups/
+/state/
+
+# Local environments and credentials
+/.venv/
+.env
+.env.*
+!.env.example
+/.aws/
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# OS files
+.DS_Store

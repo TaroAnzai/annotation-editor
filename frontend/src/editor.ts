@@ -1,0 +1,5 @@
+export type Box={class_id:number;x:number;y:number;w:number;h:number;bbox_confidence?:number;class_confidence?:number}
+export const clamp=(v:number,min:number,max:number)=>Math.max(min,Math.min(max,v))
+export const ordered=(boxes:Box[],mode:'horizontal'|'vertical')=>boxes.map((_,i)=>i).sort((a,b)=>mode==='horizontal' ? (boxes[a].x+boxes[a].w/2)-(boxes[b].x+boxes[b].w/2) || boxes[a].y-boxes[b].y : (boxes[a].y+boxes[a].h/2)-(boxes[b].y+boxes[b].h/2) || boxes[a].x-boxes[b].x)
+export function category(name:string){if(/^[1-9]m$/.test(name))return '萬子';if(/^[1-9]p$/.test(name))return '筒子';if(/^[1-9]s$/.test(name))return '索子';if(/^(east|south|west|north)$/i.test(name))return '風牌';if(/^(white|green|red)$/i.test(name))return '三元牌';if(/^(5mr|5pr|5sr|0m|0p|0s)$/i.test(name))return '赤牌';return 'その他'}
+export function tileName(name:string){return ({east:'東',south:'南',west:'西',north:'北',white:'白',green:'發',red:'中','5mr':'赤5萬','5pr':'赤5筒','5sr':'赤5索'} as Record<string,string>)[name.toLowerCase()]||name}
