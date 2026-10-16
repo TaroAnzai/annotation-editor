@@ -147,19 +147,46 @@ def inspect(root:Path,source_type:str|None=None):
             if any(x[0]!=reg.box_digest(r['boxes']) for x in old): conflicts.append(r['rel'])
     return {'kind':kind,'rows':rows,'errors':problems,'image_count':len(rows),'annotation_count':sum(bool(r['boxes']) for r in rows),'bbox_count':boxes_total,'duplicates':duplicates,'conflicts':conflicts,'manifest':manifest}
 
+def preview_token(root:Path,mode:str,source_type:str|None,scan:dict):
+    return reg.digest([str(root),mode,source_type,[(r['rel'],r['sha256'],reg.box_digest(r['boxes'])) for r in scan['rows']],scan['conflicts']])
+
 def preview(value:str,mode:str,source_type:str|None):
     root=source_path(value,mode); result=inspect(root,source_type)
-    return {k:v for k,v in result.items() if k!='rows'} | {'preview_id':reg.digest([str(root),mode,source_type,[(r['rel'],r['sha256'],reg.box_digest(r['boxes'])) for r in result['rows']]])}
+    selected=[r for r in result['rows'] if r['rel'] not in result['conflicts']]
+    return {k:v for k,v in result.items() if k!='rows'} | {'import_count':len(selected),'import_annotation_count':sum(bool(r['boxes']) for r in selected),'import_bbox_count':sum(len(r['boxes']) for r in selected),'preview_id':preview_token(root,mode,source_type,result)}
+
+def exclude_conflicts(root:Path,payload:Path,scan:dict):
+    """Remove conflicting images and their annotations from a private staged copy."""
+    excluded=set(scan['conflicts'])
+    retained_labels={r['annotation_path'] for r in scan['rows'] if r['rel'] not in excluded}
+    coco_keys={}
+    for row in scan['rows']:
+        if row['rel'] not in excluded: continue
+        (payload/row['rel']).unlink()
+        annotation=row['annotation_path']
+        if not annotation: continue
+        if row['format']=='coco': coco_keys.setdefault(annotation,set()).add(row['image_key'])
+        elif annotation not in retained_labels:
+            (payload/Path(annotation).relative_to(root)).unlink(missing_ok=True)
+    for annotation,keys in coco_keys.items():
+        target=payload/Path(annotation).relative_to(root)
+        coco=json.loads(target.read_text(encoding='utf-8'))
+        coco['images']=[image for image in coco['images'] if image['id'] not in keys]
+        coco['annotations']=[ann for ann in coco['annotations'] if ann['image_id'] not in keys]
+        target.write_text(json.dumps(coco,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
 
 def register(value:str,mode:str,source_type:str|None,name:str,expected:str,origin:str='',progress=None):
     if mode not in ('copy','move','register'): raise ImportErrorDetail('取り込み方法が不正です')
     if not name or name in ('.','..') or Path(name).name!=name or '/' in name: raise ImportErrorDetail('バッチ名が不正です')
     root=source_path(value,mode); scan=inspect(root,source_type)
-    if scan['errors'] or scan['conflicts']: raise ImportErrorDetail('取り込みエラーまたはannotation競合: '+str(scan['errors']+scan['conflicts']))
-    token=reg.digest([str(root),mode,source_type,[(r['rel'],r['sha256'],reg.box_digest(r['boxes'])) for r in scan['rows']]])
+    if scan['errors']: raise ImportErrorDetail('取り込みエラー: '+str(scan['errors']))
+    token=preview_token(root,mode,source_type,scan)
     if token!=expected: raise ImportErrorDetail('プレビュー後に入力が変更されました')
     if progress: progress(1)
     if scan['kind'] in ('merged','dataset'): raise ImportErrorDetail('merged/datasetはバージョン取り込みを使用してください')
+    if scan['conflicts'] and mode=='register': raise ImportErrorDetail('競合画像の除外にはコピーまたは移動を使用してください')
+    if scan['conflicts'] and scan['kind']=='prepared': raise ImportErrorDetail('preparedの競合はmanifestを再作成してから取り込んでください')
+    if len(scan['conflicts'])==len(scan['rows']): raise ImportErrorDetail('登録できる画像がありません')
     destination=core.DATA/'sources'/name
     if mode=='register':
         if root!=destination.resolve(): raise ImportErrorDetail('バッチ名はsourcesのフォルダー名と一致させてください')
@@ -170,8 +197,11 @@ def register(value:str,mode:str,source_type:str|None,name:str,expected:str,origi
         staged=Path(tempfile.mkdtemp(prefix='.import-',dir=core.DATA/'tmp' if (core.DATA/'tmp').exists() else destination.parent))
         try:
             shutil.copytree(root,staged/'payload')
+            if scan['conflicts']: exclude_conflicts(root,staged/'payload',scan)
             copied=inspect(staged/'payload',source_type)
-            if [(r['rel'],r['sha256']) for r in copied['rows']]!=[(r['rel'],r['sha256']) for r in scan['rows']]: raise ImportErrorDetail('コピー検証に失敗しました')
+            excluded=set(scan['conflicts'])
+            selected=[r for r in scan['rows'] if r['rel'] not in excluded]
+            if copied['errors'] or copied['conflicts'] or [(r['rel'],r['sha256'],reg.box_digest(r['boxes'])) for r in copied['rows']]!=[(r['rel'],r['sha256'],reg.box_digest(r['boxes'])) for r in selected]: raise ImportErrorDetail('コピー検証に失敗しました: '+str(copied['errors']+copied['conflicts']))
             (staged/'payload').replace(destination)
         finally: shutil.rmtree(staged,ignore_errors=True)
     if progress: progress(2)
@@ -179,24 +209,30 @@ def register(value:str,mode:str,source_type:str|None,name:str,expected:str,origi
         with reg.connect() as db:
             existing=db.execute('SELECT id FROM batches WHERE name=? OR path=?',(name,reg.rel(destination))).fetchone()
             if existing: return {'batch_id':existing[0],'already_registered':True}
-            cur=db.execute('INSERT INTO batches(name,path,format,origin,provenance,created_at) VALUES(?,?,?,?,?,?)',(name,reg.rel(destination),scan['kind'],origin,json.dumps(scan['manifest'] or {},ensure_ascii=False),reg.now()))
+            provenance=dict(scan['manifest'] or {})
+            if scan['conflicts']: provenance['excluded_conflicts']=scan['conflicts']
+            cur=db.execute('INSERT INTO batches(name,path,format,origin,provenance,created_at) VALUES(?,?,?,?,?,?)',(name,reg.rel(destination),scan['kind'],origin,json.dumps(provenance,ensure_ascii=False),reg.now()))
             batch_id=cur.lastrowid
             for r in scan['rows']:
+                if r['rel'] in scan['conflicts']: continue
                 f=destination/r['rel'];h=reg.sha(f)
                 if h!=r['sha256']: raise ImportErrorDetail(f'コピー検証失敗: {f}')
+                d=reg.box_digest(r['boxes'])
                 old=db.execute('SELECT id FROM images WHERE sha256=?',(h,)).fetchone()
-                if old: image_id=old[0]
+                if old:
+                    if db.execute('SELECT 1 FROM annotations WHERE image_id=? AND content_sha256!=? LIMIT 1',(old[0],d)).fetchone(): raise ImportErrorDetail(f"登録中にannotation競合が発生しました: {r['rel']}")
+                    image_id=old[0]
                 else:
                     image_id=db.execute('INSERT INTO images(sha256,path,filename,width,height,source_type,origin,created_at) VALUES(?,?,?,?,?,?,?,?)',(h,reg.rel(f),f.name,r['width'],r['height'],r['source_type'],origin,reg.now())).lastrowid
                 if db.execute('SELECT 1 FROM batch_images WHERE batch_id=? AND image_id=?',(batch_id,image_id)).fetchone(): continue
                 db.execute('INSERT INTO batch_images(batch_id,image_id,path,duplicate) VALUES(?,?,?,?)',(batch_id,image_id,reg.rel(f),bool(old)))
-                d=reg.box_digest(r['boxes']); ann_path=reg.rel(destination/Path(r['annotation_path']).relative_to(root)) if r['annotation_path'] else None
+                ann_path=reg.rel(destination/Path(r['annotation_path']).relative_to(root)) if r['annotation_path'] else None
                 status=('provisional' if r['format']=='yolo' else 'unreviewed') if r['boxes'] else 'unannotated'
                 ann_id=db.execute('INSERT INTO annotations(batch_id,image_id,format,path,image_key,content_sha256,content_json,status,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(batch_id,image_id,r['format'],ann_path,str(r['image_key']) if r['image_key'] is not None else None,d,json.dumps(r['boxes']),status,reg.now())).lastrowid
                 db.execute('INSERT INTO annotation_history(annotation_id,revision,content_sha256,changed_at) VALUES(?,?,?,?)',(ann_id,1,d,reg.now()))
     except Exception:
         if mode!='register': shutil.rmtree(destination,ignore_errors=True)
         raise
-    if mode=='move': shutil.rmtree(root)
+    if mode=='move' and not scan['conflicts']: shutil.rmtree(root)
     if progress: progress(3)
-    return {'batch_id':batch_id,'already_registered':False,'image_count':len(scan['rows'])}
+    return {'batch_id':batch_id,'already_registered':False,'image_count':len(scan['rows'])-len(scan['conflicts']),'excluded_conflicts':scan['conflicts'],'source_retained':mode=='move' and bool(scan['conflicts'])}

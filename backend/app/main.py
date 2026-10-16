@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from . import core, importer, registry, versions, export
+from . import core, importer, registry, versions, export, folder_picker
 from PIL import Image
 
 app=FastAPI(title='Mahjong Annotation Editor')
@@ -19,6 +19,8 @@ class ImportBody(BaseModel):
     name:str=''
     preview_id:str|None=None
     origin:str=''
+class FolderPickerBody(BaseModel):
+    current_path:str=''
 class VersionBody(BaseModel):
     parent:str|None=None
     batch_ids:list[int]|None=None
@@ -91,6 +93,10 @@ def batches(): return registry.list_batches()
 def batch_confirm(batch_id:int): return job('confirm_batch',registry.confirm_batch,batch_id)
 @app.get('/api/manage/analysis')
 def analysis(): return registry.analysis()
+@app.post('/api/manage/import/select-folder')
+def select_import_folder(body:FolderPickerBody):
+    try: return {'path':folder_picker.choose_folder(body.current_path)}
+    except RuntimeError as e: raise HTTPException(503,str(e))
 @app.post('/api/manage/import/preview')
 def import_preview(body:ImportBody):
     try:return importer.preview(body.path,body.mode,body.source_type)

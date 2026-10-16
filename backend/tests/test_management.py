@@ -41,8 +41,51 @@ def test_yolo_import_conflict_and_rollback(root):
     with registry.connect() as db: assert db.execute('SELECT COUNT(*) FROM images').fetchone()[0]==3
     (p/'labels'/'0.txt').write_text('1 0.5 0.5 0.4 0.4\n')
     preview=importer.preview(str(p),'copy','real');assert preview['conflicts']
-    with pytest.raises(ValueError): importer.register(str(p),'copy','real','third',preview['preview_id'])
-    assert not (core.DATA/'sources'/'third').exists()
+    assert preview['import_count']==2
+    result=importer.register(str(p),'copy','real','third',preview['preview_id'])
+    assert result['image_count']==2 and result['excluded_conflicts']==['images/0.png']
+    stored=core.DATA/'sources'/'third'
+    assert not (stored/'images'/'0.png').exists()
+    assert not (stored/'labels'/'0.txt').exists()
+    assert (p/'images'/'0.png').exists() and (p/'labels'/'0.txt').exists()
+    assert importer.inspect(stored,'real')['image_count']==2
+    with registry.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM batch_images WHERE batch_id=?',(result['batch_id'],)).fetchone()[0]==2
+        assert db.execute('SELECT COUNT(*) FROM images').fetchone()[0]==3
+
+def test_conflicting_yolo_move_retains_original(root):
+    p=yolo(root,'move_input',2);register(p,'first','real')
+    (p/'labels'/'0.txt').write_text('1 0.5 0.5 0.4 0.4\n')
+    preview=importer.preview(str(p),'move','real')
+    result=importer.register(str(p),'move','real','second',preview['preview_id'])
+    assert result['source_retained'] is True
+    assert p.exists() and (p/'images'/'0.png').exists()
+    assert not (core.DATA/'sources'/'second'/'images'/'0.png').exists()
+
+def test_all_conflicting_images_are_not_registered(root):
+    p=yolo(root,'all_conflicts',1);register(p,'first','real')
+    (p/'labels'/'0.txt').write_text('1 0.5 0.5 0.4 0.4\n')
+    preview=importer.preview(str(p),'copy','real')
+    assert preview['import_count']==0
+    with pytest.raises(importer.ImportErrorDetail,match='登録できる画像がありません'):
+        importer.register(str(p),'copy','real','second',preview['preview_id'])
+    assert not (core.DATA/'sources'/'second').exists()
+
+def test_conflicting_coco_copy_removes_image_and_annotation(root):
+    p=coco(root,'coco_input',2,'real');register(p,'first','real')
+    label=p/'annotations'/'instances.json';value=json.loads(label.read_text())
+    value['annotations'][0]['category_id']=2
+    label.write_text(json.dumps(value))
+    preview=importer.preview(str(p),'copy','real')
+    assert preview['conflicts']==['images/0.png']
+    result=importer.register(str(p),'copy','real','second',preview['preview_id'])
+    stored=core.DATA/'sources'/'second'
+    assert result['image_count']==1
+    assert not (stored/'images'/'0.png').exists()
+    saved=json.loads((stored/'annotations'/'instances.json').read_text())
+    assert [image['file_name'] for image in saved['images']]==['1.png']
+    assert [annotation['image_id'] for annotation in saved['annotations']]==[2]
+    assert importer.inspect(stored,'real')['image_count']==1
 
 def test_coco_edit_preserves_other_and_backup(root):
     p=coco(root,'coco',2,'synthetic');register(p,'coco','synthetic')

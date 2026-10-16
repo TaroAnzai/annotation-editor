@@ -73,6 +73,58 @@ it('uses in-page dropdowns for import settings and sends the selected values to 
  expect(posts[0]).toEqual({url:'/api/manage/import/preview',body:{path:'',mode:'move',source_type:null,name:'',origin:''}})
 })
 
+it('uses the selected folder name as the batch default and preserves manual edits',async()=>{
+ const posts:{url:string;body:any}[]=[]
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='POST'){
+   posts.push({url,body:JSON.parse(String(init.body))})
+   return {ok:true,json:async()=>({path:['/chosen/dataset',null,'/chosen/next/','/chosen/third'][posts.length-1]})}
+  }
+  return {ok:true,json:async()=>url==='/api/manage/batches'?[]:url==='/api/manage/versions'?[]:{}}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(view.getByText('データ取り込み'))
+ const input=view.getByLabelText('元フォルダー') as HTMLInputElement
+ const batchName=view.getByLabelText('バッチ名') as HTMLInputElement
+ fireEvent.change(input,{target:{value:'/old/dataset'}})
+ fireEvent.click(input)
+ await waitFor(()=>expect(input.value).toBe('/chosen/dataset'))
+ expect(batchName.value).toBe('dataset')
+ expect(posts[0]).toEqual({url:'/api/manage/import/select-folder',body:{current_path:'/old/dataset'}})
+ fireEvent.click(view.getByRole('button',{name:'参照…'}))
+ await waitFor(()=>expect(posts).toHaveLength(2))
+ expect(input.value).toBe('/chosen/dataset')
+ expect(batchName.value).toBe('dataset')
+ fireEvent.click(view.getByRole('button',{name:'参照…'}))
+ await waitFor(()=>expect(input.value).toBe('/chosen/next/'))
+ expect(batchName.value).toBe('next')
+ fireEvent.change(batchName,{target:{value:'custom-batch'}})
+ fireEvent.click(view.getByRole('button',{name:'参照…'}))
+ await waitFor(()=>expect(input.value).toBe('/chosen/third'))
+ expect(batchName.value).toBe('custom-batch')
+})
+
+it('allows a duplicate image but explains an annotation conflict',async()=>{
+ let conflict=false
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='POST')return {ok:true,json:async()=>({kind:'yolo',image_count:2,import_count:conflict?1:2,import_annotation_count:conflict?1:2,import_bbox_count:conflict?1:2,annotation_count:2,bbox_count:2,duplicates:1,conflicts:conflict?['images/duplicate.png']:[],errors:[],preview_id:'preview',manifest:{}})}
+  return {ok:true,json:async()=>url==='/api/manage/batches'?[]:url==='/api/manage/versions'?[]:{}}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(view.getByText('データ取り込み'))
+ fireEvent.change(view.getByLabelText('バッチ名'),{target:{value:'new-batch'}})
+ fireEvent.click(view.getByText('検証・プレビュー'))
+ await waitFor(()=>expect(view.getByText(/annotationが一致する重複画像は既存の画像として登録します/)).toBeTruthy())
+ expect((view.getByText('この内容を登録') as HTMLButtonElement).disabled).toBe(false)
+ conflict=true
+ fireEvent.click(view.getByText('検証・プレビュー'))
+ await waitFor(()=>expect(view.getByText('annotation競合: images/duplicate.png')).toBeTruthy())
+ expect(view.getByText(/競合 1 件を除外し、画像 1 枚 \/ annotation 1 件 \/ BBox 1 件を登録します/)).toBeTruthy()
+ expect((view.getByText('この内容を登録') as HTMLButtonElement).disabled).toBe(false)
+})
+
 it('uses POST for batch confirmation without a request body',async()=>{
  const calls:{url:string;method:string;body:any}[]=[]
  vi.stubGlobal('confirm',vi.fn(()=>true))
