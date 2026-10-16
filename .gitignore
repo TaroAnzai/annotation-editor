@@ -2,6 +2,14 @@
 /data/
 /backups/
 /state/
+/exports/
+/registry/
+*.sqlite
+*.sqlite-*
+*.db
+*.zip
+*.bak
+rclone.conf
 
 # Local environments and credentials
 /.venv/

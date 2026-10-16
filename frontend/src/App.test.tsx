@@ -30,6 +30,49 @@ afterEach(()=>{cleanup();vi.unstubAllGlobals()})
 async function opened(){const view=render(<App/>);await waitFor(()=>expect(view.getByText('sample')).toBeTruthy());fireEvent.click(view.getByText('sample'));await waitFor(()=>expect(view.getByText('1.jpg')).toBeTruthy());return view}
 
 describe('image editing workflow',()=>{
+ it('shows loading progress for the image list and image detail',async()=>{
+  const original=globalThis.fetch
+  let releaseList!:()=>void,releaseDetail!:()=>void
+  const listGate=new Promise<void>(resolve=>{releaseList=resolve})
+  const detailGate=new Promise<void>(resolve=>{releaseDetail=resolve})
+  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+   if(String(input)==='/api/datasets/ds/images')await listGate
+   if(String(input)==='/api/images/img1')await detailGate
+   return original(input,init)
+  }))
+  const view=render(<App/>)
+  await waitFor(()=>expect(view.getByText('sample')).toBeTruthy())
+  fireEvent.click(view.getByText('sample'))
+  expect(view.getByRole('progressbar')).toBeTruthy()
+  expect(view.getByText('画像一覧を読み込み中…')).toBeTruthy()
+  releaseList()
+  await waitFor(()=>expect(view.getByText('画像を読み込み中…')).toBeTruthy())
+  releaseDetail()
+  await waitFor(()=>expect(view.queryByRole('progressbar')).toBeNull())
+  expect(view.getByText('1.jpg')).toBeTruthy()
+ })
+ it('clears loading progress when the image list fails',async()=>{
+  const original=globalThis.fetch
+  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>String(input)==='/api/datasets/ds/images'?{ok:false,status:500,statusText:'Server Error',json:async()=>({detail:'一覧を読み込めません'})}:original(input,init)))
+  const view=render(<App/>)
+  await waitFor(()=>expect(view.getByText('sample')).toBeTruthy())
+  fireEvent.click(view.getByText('sample'))
+  await waitFor(()=>expect(view.getByText(/一覧を読み込めません/)).toBeTruthy())
+  expect(view.queryByRole('progressbar')).toBeNull()
+ })
+ it('shows an image when a parent folder contains several datasets',async()=>{
+  const original=globalThis.fetch
+  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+   if(String(input)==='/api/folders')return {ok:true,json:async()=>({id:'root',name:'data',path:'.',children:[{id:'parent',name:'sources',path:'sources',children:[]}]})}
+   if(String(input)==='/api/datasets')return {ok:true,json:async()=>[{id:'ds',name:'first',path:'sources/first',images:2,editable:true},{id:'ds2',name:'second',path:'sources/second',images:2,editable:true}]}
+   return original(input,init)
+  }))
+  const view=render(<App/>)
+  await waitFor(()=>expect(view.getByText('sources')).toBeTruthy())
+  fireEvent.click(view.getByText('sources'))
+  await waitFor(()=>expect(view.getByText('1.jpg')).toBeTruthy())
+  expect(view.getByText('sources/second (2枚)')).toBeTruthy()
+ })
  it('keeps BBOX labels readable at a fixed screen size while zooming',async()=>{
   const view=render(<App/>);await waitFor(()=>expect(view.getByText('sample')).toBeTruthy())
   const stage=view.container.querySelector<HTMLElement>('.stage')!

@@ -6,7 +6,7 @@ import yaml
 from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parents[3]
-DATA = ROOT / 'data'
+DATA = Path(os.environ.get('ANNOTATION_DATA_ROOT', str(ROOT / 'data'))).expanduser().resolve()
 EDITOR = ROOT / 'annotation-editor'
 IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
 
@@ -29,6 +29,7 @@ def folders():
             if p.is_dir() and not p.is_symlink():
                 children.append(node(p))
         return {'id': ident(path), 'name': path.name, 'path': str(path.relative_to(DATA)), 'children': children}
+    DATA.mkdir(parents=True, exist_ok=True)
     return node(DATA)
 
 def image_paths(path):
@@ -36,6 +37,7 @@ def image_paths(path):
 
 def datasets():
     out = []
+    DATA.mkdir(parents=True, exist_ok=True)
     for root, dirs, files in os.walk(DATA, followlinks=False):
         dirs[:] = [d for d in dirs if not (Path(root)/d).is_symlink() and 'preview' not in d.lower()]
         p = Path(root)
@@ -43,7 +45,11 @@ def datasets():
         imgs = p/'images'
         labels = p/'labels'
         yml = p/'data.yaml'
-        if imgs.is_dir() and labels.is_dir() and yml.is_file() and not any(x.is_symlink() for x in (imgs,labels,yml)):
+        coco_file = next((q for q in (p/'annotations'/'instances.json', p/'labels'/'instances.json', p/'_annotations.coco.json') if q.is_file() and not q.is_symlink()), None)
+        if coco_file and ((imgs.is_dir() and not imgs.is_symlink()) or image_paths(p)):
+            out.append({'id':ident(p),'name':p.name,'path':str(p.relative_to(DATA)),'images':len(image_paths(imgs if imgs.is_dir() else p)),'editable':not p.is_relative_to(DATA/'versions'),'format':'coco','coco_path':str(coco_file.relative_to(DATA)),'images_direct':not imgs.is_dir()})
+            dirs[:] = [d for d in dirs if d != 'images']
+        elif imgs.is_dir() and labels.is_dir() and yml.is_file() and not any(x.is_symlink() for x in (imgs,labels,yml)):
             out.append({'id': ident(p), 'name': p.parent.name if p.name == 'roboflow_import' else p.name, 'path': str(p.relative_to(DATA)), 'images': len(image_paths(imgs)), 'editable': True})
             dirs[:] = [d for d in dirs if d not in ('images','labels')]
         elif yml.is_file() and not yml.is_symlink():
@@ -54,6 +60,11 @@ def datasets():
                     splits.append(split)
                     out.append({'id':ident(q),'name':p.name+' / '+split,'path':str(q.relative_to(DATA)),'images':len(image_paths(q/'images')),'editable':True,'yaml_path':str(yml.relative_to(DATA))})
             dirs[:] = [d for d in dirs if d not in splits]
+        elif imgs.is_dir() and not imgs.is_symlink() and image_paths(imgs) and p.is_relative_to(DATA/'sources'):
+            out.append({'id':ident(p),'name':p.name,'path':str(p.relative_to(DATA)),'images':len(image_paths(imgs)),'editable':True,'format':'images'})
+            dirs[:] = [d for d in dirs if d != 'images']
+        elif image_paths(p) and p.is_relative_to(DATA/'sources'):
+            out.append({'id':ident(p),'name':p.name,'path':str(p.relative_to(DATA)),'images':len(image_paths(p)),'editable':True,'format':'images','images_direct':True})
         elif image_paths(p) and not ((p/'roboflow_import'/'images').is_dir() and (p/'roboflow_import'/'labels').is_dir() and (p/'roboflow_import'/'data.yaml').is_file()):
             out.append({'id': ident(p), 'name': p.name, 'path': str(p.relative_to(DATA)), 'images': len(image_paths(p)), 'editable': False})
     return sorted(out, key=lambda d: natural(d['path']))
@@ -76,27 +87,61 @@ def classes(p):
         raise HTTPException(422, f'data.yaml読み込みエラー: {e}')
 
 def classes_for(d,p):
+    if d.get('format') == 'images':
+        from .schema import canonical_names
+        return list(canonical_names())
+    if d.get('format') == 'coco':
+        from .schema import canonical_names, read_coco, category_mapping
+        coco=read_coco(safe(DATA/d['coco_path']))
+        category_mapping(safe(DATA/d['coco_path']),coco)
+        return list(canonical_names())
     return classes(safe(DATA/d['yaml_path']).parent) if d.get('yaml_path') else classes(p)
 
 def images(dataset_id):
     d,p = dataset(dataset_id)
-    folder = p/'images' if d['editable'] else p
+    folder = p/'images' if not d.get('images_direct') and (p/'images').is_dir() else p
+    files=image_paths(folder)
+    from . import registry
+    statuses=registry.all_statuses()
+    coco_counts={}
+    coco_error=False
+    if d.get('format')=='coco':
+        from .schema import read_coco, category_mapping, validate_coco
+        try:
+            path=safe(DATA/d['coco_path'])
+            value=read_coco(path)
+            category_mapping(path,value)
+            validate_coco(value,require_canonical=False)
+            by_id={item['id']:item['file_name'] for item in value['images']}
+            if len({Path(name).name for name in by_id.values()})!=len(by_id):
+                raise ValueError('同名のCOCO画像があります')
+            coco_counts={Path(name).name:0 for name in by_id.values()}
+            for annotation in value['annotations']:
+                coco_counts[Path(by_id[annotation['image_id']]).name]+=1
+        except Exception:
+            coco_error=True
+    yolo_classes=len(classes_for(d,p)) if d['editable'] and d.get('format') not in ('coco','images') else 0
     result=[]
-    nclasses=len(classes_for(d,p)) if d['editable'] else 0
-    for f in image_paths(folder):
+    for f in files:
         label=p/'labels'/f'{f.stem}.txt'
         count=0; error=False
-        if d['editable'] and label.exists():
-            try: count=len(parse_label(label.read_text(encoding='utf-8-sig'),nclasses))
-            except (UnicodeError,HTTPException): error=True
-        state=status_for(f)
-        result.append({'id':ident(f),'name':f.name,'status':state['status'],'modified':state['modified'],'label_exists':label.exists() if d['editable'] else False,'bbox_count':count,'label_error':error})
+        if d.get('format')=='coco':
+            count=coco_counts.get(f.name,0)
+            error=coco_error or f.name not in coco_counts
+        elif d['editable'] and d.get('format')!='images':
+            try: count=len(parse_label(label.read_text(encoding='utf-8-sig') if label.exists() else '',yolo_classes))
+            except (UnicodeError,OSError,HTTPException): error=True
+        state=statuses.get(str(f.relative_to(DATA)))
+        if state is None:
+            try: state=json.loads(state_path(f).read_text(encoding='utf-8'))
+            except FileNotFoundError: state={'status':'unreviewed','modified':False}
+        result.append({'id':ident(f),'name':f.name,'status':state['status'],'modified':state['modified'],'label_exists':(label.exists() or d.get('format')=='coco') if d['editable'] or d.get('format')=='coco' else False,'bbox_count':count,'label_error':error})
     return result
 
 def image(image_id):
     for d in datasets():
         p = safe(DATA/d['path'])
-        folder = p/'images' if d['editable'] else p
+        folder = p/'images' if not d.get('images_direct') and (p/'images').is_dir() else p
         for f in image_paths(folder):
             if ident(f)==image_id: return d,p,f
     raise HTTPException(404, '画像が見つかりません')
@@ -105,6 +150,11 @@ def state_path(f):
     return EDITOR/'state'/(ident(f)+'.json')
 
 def status_for(f):
+    try:
+        from .registry import get_status
+        registered=get_status(f)
+        if registered: return registered
+    except Exception: pass
     try: return json.loads(state_path(f).read_text(encoding='utf-8'))
     except FileNotFoundError: return {'status':'unreviewed','modified':False}
 
@@ -119,10 +169,11 @@ def atomic_write(path, content: bytes):
         if tmp and tmp.exists(): tmp.unlink()
 
 def set_status(f, status, modified=None):
-    if status not in ('unreviewed','reviewed','held'): raise HTTPException(422,'状態が不正です')
+    if status not in ('unannotated','provisional','unreviewed','reviewed','held'): raise HTTPException(422,'状態が不正です')
     state=status_for(f); state['status']=status
     if modified is not None: state['modified']=modified
-    atomic_write(state_path(f),json.dumps(state,ensure_ascii=False).encode())
+    from .registry import update_status
+    if not update_status(f,status,modified): atomic_write(state_path(f),json.dumps(state,ensure_ascii=False).encode())
     return state
 
 def version(path):
@@ -152,6 +203,11 @@ def validate_boxes(boxes,nclasses):
         except Exception: raise HTTPException(422,'BBoxまたはクラスIDが不正です')
 
 def label_info(d,p,f):
+    if d.get('format') == 'coco':
+        from .schema import coco_boxes
+        path=safe(DATA/d['coco_path'])
+        try: return {'boxes':coco_boxes(path,f),'version':version(path),'error':None}
+        except Exception as e: return {'boxes':[],'version':version(path),'error':str(e)}
     if not d['editable']: return {'boxes':[],'version':'readonly','error':None}
     names=classes_for(d,p); path=safe(p/'labels'/f'{f.stem}.txt')
     v=version(path)
@@ -161,6 +217,11 @@ def label_info(d,p,f):
 
 def save(d,p,f,boxes,expected):
     if not d['editable']: raise HTTPException(403,'閲覧専用です')
+    if d.get('format') == 'coco':
+        from .schema import save_coco
+        result=save_coco(safe(DATA/d['coco_path']),f,boxes,expected)
+        set_status(f,'unreviewed',True)
+        return result
     names=classes_for(d,p);validate_boxes(boxes,len(names))
     path=safe(p/'labels'/f'{f.stem}.txt')
     if version(path)!=expected: raise HTTPException(409,'外部でラベルが変更されました。再読み込みしてください')
@@ -178,5 +239,5 @@ def save(d,p,f,boxes,expected):
     # Validate serialized text before replacing the source.
     parse_label(content.decode(),len(names))
     atomic_write(path,content)
-    set_status(f,status_for(f)['status'],True)
+    set_status(f,'unreviewed' if status_for(f)['status']=='reviewed' else status_for(f)['status'],True)
     return label_info(d,p,f)

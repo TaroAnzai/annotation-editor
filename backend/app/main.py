@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException
+from concurrent.futures import ThreadPoolExecutor
+from uuid import uuid4
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from . import core
+from . import core, importer, registry, versions, export
 from PIL import Image
 
 app=FastAPI(title='Mahjong Annotation Editor')
@@ -10,6 +12,43 @@ class SaveBody(BaseModel):
     version:str
 class StatusBody(BaseModel):
     status:str
+class ImportBody(BaseModel):
+    path:str
+    mode:str='copy'
+    source_type:str|None=None
+    name:str=''
+    preview_id:str|None=None
+    origin:str=''
+class VersionBody(BaseModel):
+    parent:str|None=None
+    batch_ids:list[int]|None=None
+    image_ids:list[int]|None=None
+    test_real:int=0
+    test_synthetic:int=0
+    val_ratio:float=.1
+    seed:int=42
+    keep_test:bool=True
+    description:str=''
+class ReferenceVersionBody(BaseModel):
+    parent:str
+    reference_path:str
+    description:str=''
+pool=ThreadPoolExecutor(max_workers=2)
+def job(kind,fn,*args,**kwargs):
+    key=uuid4().hex
+    total={'import':3,'import_version':3,'version':6,'reference':6,'unpartitioned':3,'confirm_batch':2,'archive':2,'upload':3}.get(kind,1)
+    with registry.connect() as db: db.execute('INSERT INTO jobs(id,kind,status,progress,total,updated_at) VALUES(?,?,?,?,?,?)',(key,kind,'queued',0,total,registry.now()))
+    def run():
+        def progress(n):
+            with registry.connect() as db: db.execute('UPDATE jobs SET progress=?,updated_at=? WHERE id=?',(n,registry.now(),key))
+        with registry.connect() as db: db.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?",(registry.now(),key))
+        try:
+            result=fn(*args,**kwargs,progress=progress)
+            with registry.connect() as db: db.execute("UPDATE jobs SET status='complete',progress=?,result=?,updated_at=? WHERE id=?",(total,str(result),registry.now(),key))
+        except Exception as e:
+            with registry.connect() as db: db.execute("UPDATE jobs SET status='failed',error=?,updated_at=? WHERE id=?",(str(e),registry.now(),key))
+    pool.submit(run)
+    return {'job_id':key}
 
 @app.get('/api/health')
 def health(): return {'ok':True}
@@ -22,14 +61,14 @@ def images(dataset_id:str): return core.images(dataset_id)
 @app.get('/api/datasets/{dataset_id}/stats')
 def stats(dataset_id:str):
     items=core.images(dataset_id)
-    return {'total':len(items),'reviewed':sum(x['status']=='reviewed' for x in items),'held':sum(x['status']=='held' for x in items),'unreviewed':sum(x['status']=='unreviewed' for x in items),'modified':sum(x['modified'] for x in items)}
+    return {'total':len(items),'reviewed':sum(x['status']=='reviewed' for x in items),'held':sum(x['status']=='held' for x in items),'unreviewed':sum(x['status'] in ('unreviewed','provisional','unannotated') for x in items),'modified':sum(x['modified'] for x in items)}
 @app.get('/api/images/{image_id}')
 def image(image_id:str):
     d,p,f=core.image(image_id)
     try:
         with Image.open(f) as im: width,height=im.size; im.verify()
     except Exception as e: raise HTTPException(422,f'画像読み込みエラー: {e}')
-    return {'id':image_id,'name':f.name,'width':width,'height':height,'editable':d['editable'],'classes':core.classes_for(d,p) if d['editable'] else [],'status':core.status_for(f),'annotations':core.label_info(d,p,f)}
+    return {'id':image_id,'name':f.name,'width':width,'height':height,'editable':d['editable'],'classes':core.classes_for(d,p) if d['editable'] or d.get('format')=='coco' else [],'status':core.status_for(f),'annotations':core.label_info(d,p,f)}
 @app.get('/api/images/{image_id}/file')
 def image_file(image_id:str):
     _,_,f=core.image(image_id)
@@ -39,7 +78,53 @@ def annotations(image_id:str):
     d,p,f=core.image(image_id);return core.label_info(d,p,f)
 @app.put('/api/images/{image_id}/annotations')
 def save_annotations(image_id:str,body:SaveBody):
-    d,p,f=core.image(image_id);return core.save(d,p,f,body.boxes,body.version)
+    d,p,f=core.image(image_id);result=core.save(d,p,f,body.boxes,body.version);registry.annotation_saved(f,body.boxes);return result
 @app.put('/api/images/{image_id}/status')
 def status(image_id:str,body:StatusBody):
-    _,_,f=core.image(image_id);return core.set_status(f,body.status)
+    d,_,f=core.image(image_id)
+    if not d['editable']: raise HTTPException(403,'閲覧専用です')
+    return core.set_status(f,body.status)
+
+@app.get('/api/manage/batches')
+def batches(): return registry.list_batches()
+@app.post('/api/manage/batches/{batch_id}/confirm')
+def batch_confirm(batch_id:int): return job('confirm_batch',registry.confirm_batch,batch_id)
+@app.get('/api/manage/analysis')
+def analysis(): return registry.analysis()
+@app.post('/api/manage/import/preview')
+def import_preview(body:ImportBody):
+    try:return importer.preview(body.path,body.mode,body.source_type)
+    except Exception as e:raise HTTPException(422,str(e))
+@app.post('/api/manage/import')
+def import_execute(body:ImportBody):
+    if not body.preview_id: raise HTTPException(422,'プレビューが必要です')
+    if importer.layout(importer.source_path(body.path,body.mode)) in ('merged','dataset'):
+        return job('import_version',versions.import_version,body.path,body.mode,body.name,body.source_type,body.preview_id)
+    return job('import',importer.register,body.path,body.mode,body.source_type,body.name,body.preview_id,body.origin)
+@app.get('/api/manage/versions')
+def version_list(): return versions.versions()
+@app.post('/api/manage/versions')
+def version_create(body:VersionBody): return job('version',versions.create,**body.model_dump())
+@app.post('/api/manage/versions/unpartitioned')
+def version_unpartitioned(body:VersionBody): return job('unpartitioned',versions.create_unpartitioned,body.batch_ids,body.description)
+@app.post('/api/manage/versions/from-reference')
+def version_from_reference(body:ReferenceVersionBody):
+    return job('reference',versions.create_from_reference,body.parent,body.reference_path,body.description)
+@app.get('/api/manage/versions/{version_id}/validate')
+def version_validate(version_id:str):
+    try:
+        with registry.connect() as db: row=db.execute('SELECT path FROM versions WHERE id=?',(version_id,)).fetchone()
+        if not row: raise ValueError('バージョンがありません')
+        return versions.validate(registry.path(row[0]))
+    except Exception as e:raise HTTPException(422,str(e))
+@app.post('/api/manage/versions/{version_id}/archive')
+def version_archive(version_id:str): return job('archive',export.archive,version_id)
+@app.get('/api/manage/drive/setup')
+def drive_setup(): return export.setup()
+@app.post('/api/manage/versions/{version_id}/upload')
+def version_upload(version_id:str,execute:bool=False): return job('upload',export.upload,version_id,execute)
+@app.get('/api/manage/jobs/{job_id}')
+def job_status(job_id:str):
+    with registry.connect() as db: row=db.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
+    if not row:raise HTTPException(404,'処理がありません')
+    return dict(row)
