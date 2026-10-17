@@ -2,7 +2,7 @@ import json, sys, zipfile
 from pathlib import Path
 import pytest
 from PIL import Image
-from app import core, importer, registry, versions, export
+from app import core, importer, registry, versions, export, main
 from app.schema import CATEGORIES, TILE_CLASSES, coco_boxes, save_coco
 
 @pytest.fixture
@@ -52,6 +52,32 @@ def test_yolo_import_conflict_and_rollback(root):
     with registry.connect() as db:
         assert db.execute('SELECT COUNT(*) FROM batch_images WHERE batch_id=?',(result['batch_id'],)).fetchone()[0]==2
         assert db.execute('SELECT COUNT(*) FROM images').fetchone()[0]==3
+
+def test_import_normalizes_legacy_yolo_without_moving_annotation_ids(root):
+    p=yolo(root,'legacy_yolo',1)
+    value=json.loads((p/'data.yaml').read_text().split('names: ',1)[1].splitlines()[0])
+    value[34:]=['5mr','5pr','5sr']
+    (p/'data.yaml').write_text('names: '+json.dumps(value)+'\nnc: 37\n')
+    (p/'labels'/'0.txt').write_text('34 0.5 0.5 0.4 0.4\n')
+    register(p,'legacy_yolo','real')
+    stored=core.DATA/'sources'/'legacy_yolo'
+    assert core.classes(stored)[34:]==['red5m','red5p','red5s']
+    assert (stored/'labels'/'0.txt').read_text().startswith('34 ')
+    assert importer.inspect(stored,'real')['rows'][0]['boxes'][0]['class_id']==34
+    assert '5mr' in (p/'data.yaml').read_text()
+
+def test_import_normalizes_legacy_coco_without_moving_annotation_ids(root):
+    p=coco(root,'legacy_coco',1,'real')
+    path=p/'annotations'/'instances.json';value=json.loads(path.read_text())
+    for i,name in enumerate(('5mr','5pr','5sr'),34): value['categories'][i]['name']=name
+    value['annotations'][0]['category_id']=35
+    path.write_text(json.dumps(value))
+    register(p,'legacy_coco','real')
+    stored=core.DATA/'sources'/'legacy_coco'/'annotations'/'instances.json'
+    saved=json.loads(stored.read_text())
+    assert [item['name'] for item in saved['categories']][-3:]==['red5m','red5p','red5s']
+    assert saved['annotations'][0]['category_id']==35
+    assert importer.inspect(stored.parent.parent,'real')['rows'][0]['boxes'][0]['class_id']==34
 
 def test_conflicting_yolo_move_retains_original(root):
     p=yolo(root,'move_input',2);register(p,'first','real')
@@ -286,3 +312,59 @@ def test_batch_confirmation_rejects_concurrent_annotation_edit(root,monkeypatch)
         registry.confirm_batch(1)
     with registry.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM annotations WHERE status='reviewed'").fetchone()[0]==0
+
+def test_batch_sync_updates_changed_annotations_and_resets_review(root):
+    register(yolo(root,'sync_input',2),'sync_batch','real')
+    review('sync_batch')
+    label=core.DATA/'sources'/'sync_batch'/'labels'/'0.txt'
+    label.write_text('0 0.5 0.5 0.4 0.4\n1 0.2 0.2 0.2 0.2\n')
+    result=registry.sync_batch_annotations(1)
+    assert '1 枚を更新' in result and '再確認が必要 1 枚' in result
+    batch=registry.list_batches()[0]
+    assert batch['bbox_count']==3
+    assert batch['reviewed_count']==1 and batch['unreviewed_count']==1
+    with registry.connect() as db:
+        rows=db.execute('SELECT revision,status,content_json FROM annotations ORDER BY image_id').fetchall()
+        assert [(r['revision'],r['status'],len(json.loads(r['content_json']))) for r in rows]==[(2,'unreviewed',2),(1,'reviewed',1)]
+    assert '0 枚を更新' in registry.sync_batch_annotations(1)
+
+def test_batch_sync_invalid_label_does_not_partially_update(root):
+    register(yolo(root,'sync_invalid',2),'sync_invalid','real')
+    stored=core.DATA/'sources'/'sync_invalid'/'labels'
+    (stored/'0.txt').write_text('0 0.5 0.5 0.4 0.4\n1 0.2 0.2 0.2 0.2\n')
+    (stored/'1.txt').write_text('invalid\n')
+    with pytest.raises(ValueError,match='検証に失敗'):
+        registry.sync_batch_annotations(1)
+    assert registry.list_batches()[0]['bbox_count']==2
+    with registry.connect() as db:
+        assert db.execute('SELECT MAX(revision) FROM annotations').fetchone()[0]==1
+
+def test_batch_sync_keeps_review_for_serialization_rounding(root):
+    register(yolo(root,'sync_rounding',1),'sync_rounding','real')
+    review('sync_rounding')
+    with registry.connect() as db:
+        row=db.execute('SELECT id,content_json FROM annotations').fetchone()
+        boxes=json.loads(row['content_json'])
+        boxes[0]['x']+=6e-10
+        db.execute('UPDATE annotations SET content_json=?,content_sha256=? WHERE id=?',
+                   (json.dumps(boxes),registry.box_digest(boxes),row['id']))
+    assert '1 枚を更新' in registry.sync_batch_annotations(1)
+    batch=registry.list_batches()[0]
+    assert batch['reviewed_count']==1 and batch['bbox_count']==1
+    with registry.connect() as db:
+        row=db.execute('SELECT status,content_sha256 FROM annotations').fetchone()
+        assert row['status']=='reviewed'
+        label=core.DATA/'sources'/'sync_rounding'/'labels'/'0.txt'
+        assert row['content_sha256']==registry.box_digest(core.parse_label(label.read_text(),37))
+
+def test_editor_save_registers_serialized_label_values(root):
+    register(yolo(root,'precise_input',1),'precise_input','real')
+    image=core.DATA/'sources'/'precise_input'/'images'/'0.png'
+    label=image.parent.parent/'labels'/'0.txt'
+    boxes=[{'class_id':1,'x':.12345678912345,'y':.2345678912345,'w':.12345678912345,'h':.2345678912345}]
+    main.save_annotations(core.ident(image),main.SaveBody(boxes=boxes,version=core.version(label)))
+    core.set_status(image,'reviewed')
+    with registry.connect() as db:
+        stored=db.execute('SELECT content_sha256 FROM annotations').fetchone()[0]
+    assert stored==registry.box_digest(core.parse_label(label.read_text(),37))
+    assert len(versions.rows_from_db([1]))==1

@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image
 import yaml
 from . import core, registry as reg
-from .schema import TILE_CLASSES, validate_coco
+from .schema import TILE_CLASSES, validate_coco, canonical_name, canonicalize_coco, normalize_yolo_yaml, normalize_coco_mapping
 
 class ImportErrorDetail(ValueError): pass
 
@@ -24,10 +24,9 @@ def mapping(root:Path, names:list[str]):
     config=root/'dataset.yaml'; data=yaml.safe_load(config.read_text()) if config.exists() else {}
     explicit=data.get('class_mapping') if isinstance(data,dict) else None
     if explicit is not None:
-        if set(explicit)!=set(names) or set(explicit.values())!=set(TILE_CLASSES) or len(explicit)!=37: raise ImportErrorDetail('class_mappingは37クラスを一対一で指定してください')
-        return {i:TILE_CLASSES.index(explicit[name]) for i,name in enumerate(names)}
-    aliases={'5mr':'red5m','5pr':'red5p','5sr':'red5s'}
-    normalized=[aliases.get(n,n) for n in names]
+        if set(explicit)!=set(names) or set(canonical_name(n) for n in explicit.values())!=set(TILE_CLASSES) or len(explicit)!=37: raise ImportErrorDetail('class_mappingは37クラスを一対一で指定してください')
+        return {i:TILE_CLASSES.index(canonical_name(explicit[name])) for i,name in enumerate(names)}
+    normalized=[canonical_name(n) for n in names]
     if len(normalized)!=37 or set(normalized)!=set(TILE_CLASSES): raise ImportErrorDetail('37クラスの明示的なmappingが必要です')
     return {i:TILE_CLASSES.index(n) for i,n in enumerate(normalized)}
 
@@ -79,12 +78,12 @@ def inspect(root:Path,source_type:str|None=None):
             coco=json.loads(annotation_file.read_text(encoding='utf-8'))
             validate_coco(coco,imgdir,False)
             names={int(c['id']):c['name'] for c in coco['categories']}
-            if names=={i+1:n for i,n in enumerate(TILE_CLASSES)}: cmap={i:i-1 for i in names}
+            if {i:canonical_name(n) for i,n in names.items()}=={i+1:n for i,n in enumerate(TILE_CLASSES)}: cmap={i:i-1 for i in names}
             else:
                 config=root/'dataset.yaml'
                 specified=(yaml.safe_load(config.read_text()) or {}).get('class_mapping') if config.exists() else None
-                if not specified or set(specified.values())!=set(TILE_CLASSES) or set(specified)!=set(names.values()): raise ImportErrorDetail('COCOカテゴリには完全なclass_mappingが必要です')
-                cmap={i:TILE_CLASSES.index(specified[n]) for i,n in names.items()}
+                if not specified or set(canonical_name(n) for n in specified.values())!=set(TILE_CLASSES) or set(specified)!=set(names.values()): raise ImportErrorDetail('COCOカテゴリには完全なclass_mappingが必要です')
+                cmap={i:TILE_CLASSES.index(canonical_name(specified[n])) for i,n in names.items()}
             for a in coco['annotations']: ann_by.setdefault(a['image_id'],[]).append(a)
             records={str(i['file_name']):i for i in coco['images']}
             if len(records)!=len(coco['images']): raise ImportErrorDetail('COCO画像名が重複しています')
@@ -175,6 +174,28 @@ def exclude_conflicts(root:Path,payload:Path,scan:dict):
         coco['annotations']=[ann for ann in coco['annotations'] if ann['image_id'] not in keys]
         target.write_text(json.dumps(coco,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
 
+def normalize_dataset_files(root:Path,scan:dict,source_root:Path|None=None):
+    """Normalize editable class definitions without changing annotation IDs."""
+    if scan['kind']=='yolo':
+        normalize_yolo_yaml(root/'data.yaml')
+        return
+    source_root=source_root or root
+    paths={Path(r['annotation_path']).relative_to(source_root) for r in scan['rows'] if r['format']=='coco' and r['annotation_path']}
+    for original in paths:
+        path=root/original
+        value=json.loads(path.read_text(encoding='utf-8'))
+        before=json.dumps(value,ensure_ascii=False,sort_keys=True)
+        canonicalize_coco(value,path)
+        if json.dumps(value,ensure_ascii=False,sort_keys=True)!=before:
+            core.atomic_write(path,(json.dumps(value,ensure_ascii=False,indent=2)+'\n').encode('utf-8'))
+            manifest=root/'manifest.json'
+            if scan['kind']=='prepared' and manifest.is_file():
+                metadata=json.loads(manifest.read_text(encoding='utf-8'))
+                if 'annotation_sha256' in metadata:
+                    metadata['annotation_sha256']='sha256:'+reg.digest(value)
+                    core.atomic_write(manifest,(json.dumps(metadata,ensure_ascii=False,indent=2)+'\n').encode('utf-8'))
+    if paths: normalize_coco_mapping(root/next(iter(paths)))
+
 def register(value:str,mode:str,source_type:str|None,name:str,expected:str,origin:str='',progress=None):
     if mode not in ('copy','move','register'): raise ImportErrorDetail('取り込み方法が不正です')
     if not name or name in ('.','..') or Path(name).name!=name or '/' in name: raise ImportErrorDetail('バッチ名が不正です')
@@ -191,6 +212,7 @@ def register(value:str,mode:str,source_type:str|None,name:str,expected:str,origi
     if mode=='register':
         if root!=destination.resolve(): raise ImportErrorDetail('バッチ名はsourcesのフォルダー名と一致させてください')
         staged=None
+        normalize_dataset_files(root,scan)
     else:
         destination.parent.mkdir(parents=True,exist_ok=True)
         if destination.exists(): raise ImportErrorDetail('同名バッチは既に存在します')
@@ -198,6 +220,7 @@ def register(value:str,mode:str,source_type:str|None,name:str,expected:str,origi
         try:
             shutil.copytree(root,staged/'payload')
             if scan['conflicts']: exclude_conflicts(root,staged/'payload',scan)
+            normalize_dataset_files(staged/'payload',scan,root)
             copied=inspect(staged/'payload',source_type)
             excluded=set(scan['conflicts'])
             selected=[r for r in scan['rows'] if r['rel'] not in excluded]

@@ -52,5 +52,12 @@ describe('editor utilities',()=>{
   expect(category('east')).toBe('風牌')
   expect(tileName('0p')).toBe('赤5筒')
  })
+ it('shows canonical red fives in their suits',()=>{
+  const groups=groupedClasses(['red5m','5m','red5p','5p','red5s','5s'])
+  expect(groups['萬子']).toEqual([{name:'5m',id:1},{name:'red5m',id:0}])
+  expect(groups['筒子']).toEqual([{name:'5p',id:3},{name:'red5p',id:2}])
+  expect(groups['索子']).toEqual([{name:'5s',id:5},{name:'red5s',id:4}])
+  expect(tileName('red5m')).toBe('赤5萬')
+ })
  it('constrains coordinate edits',()=>{expect(clamp(1.2,0,1)).toBe(1)})
 })

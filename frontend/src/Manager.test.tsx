@@ -207,6 +207,22 @@ it('uses POST for batch confirmation without a request body',async()=>{
  expect(calls[0]).toEqual({url:'/api/manage/batches/3/confirm',method:'POST',body:{}})
 })
 
+it('starts annotation to DB sync for the selected batch',async()=>{
+ const calls:string[]=[]
+ vi.stubGlobal('confirm',vi.fn(()=>true))
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='POST'){calls.push(url);return {ok:true,json:async()=>({job_id:'sync-job'})}}
+  const value=url==='/api/manage/batches'?[{id:3,name:'synthetic',format:'coco',origin:'',image_count:2,annotation_count:2,bbox_count:2,source_types:{synthetic:2},reviewed_count:2,unreviewed_count:0,held_count:0,duplicate_count:0}]:
+   url==='/api/manage/versions'?[]:url==='/api/manage/analysis'?{}:{kind:'sync_batch',status:'running',progress:0,total:2}
+  return {ok:true,json:async()=>value}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ const button=await view.findByRole('button',{name:'アノテーションでDBを更新'})
+ fireEvent.click(button)
+ await waitFor(()=>expect(calls).toEqual(['/api/manage/batches/3/sync']))
+})
+
 it('resumes a running job after leaving and returning to data management',async()=>{
  vi.stubGlobal('confirm',vi.fn(()=>true))
  let polls=0
@@ -232,6 +248,23 @@ it('resumes a running job after leaving and returning to data management',async(
  await waitFor(()=>expect(second.getByText('確認完了')).toBeTruthy(),{timeout:2500})
  expect(polls).toBeGreaterThanOrEqual(1)
  expect(sessionStorage.getItem('mahjong-annotation-editor-active-job')).toBeNull()
+})
+
+it('summarizes an older verbose version result and lets the user dismiss it',async()=>{
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='POST')return {ok:true,json:async()=>({job_id:'verbose-job'})}
+  if(url==='/api/manage/jobs/verbose-job')return {ok:true,json:async()=>({kind:'version',status:'complete',progress:6,total:6,result:"{'id': 'v003', 'manifest': {'leaf_sources': ["+'x'.repeat(2000)+"]}"})}
+  return {ok:true,json:async()=>url==='/api/manage/batches'?[]:url==='/api/manage/versions'?[]:url==='/api/manage/analysis'?{}:{ready:false,message:'未設定'}}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(view.getByText('バージョン管理'))
+ fireEvent.click(view.getByText('完成バージョン作成'))
+ await waitFor(()=>expect(view.getByText('v003 を作成しました')).toBeTruthy())
+ expect(view.queryByText(/version: complete/)).toBeNull()
+ expect(view.container.querySelector('.manager-message')?.textContent).not.toContain('leaf_sources')
+ fireEvent.click(view.getByRole('button',{name:'完了通知を閉じる'}))
+ expect(view.queryByText('v003 を作成しました')).toBeNull()
 })
 
 it.each([

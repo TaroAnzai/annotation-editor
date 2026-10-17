@@ -36,12 +36,12 @@ export function placeBoxLabel(boxes:Box[],index:number,imageWidth:number,imageHe
  return {...chosen,width:labelWidth,height:labelHeight}
 }
 export const ordered=(boxes:Box[],mode:'horizontal'|'vertical')=>boxes.map((_,i)=>i).sort((a,b)=>mode==='horizontal' ? (boxes[a].x+boxes[a].w/2)-(boxes[b].x+boxes[b].w/2) || boxes[a].y-boxes[b].y : (boxes[a].y+boxes[a].h/2)-(boxes[b].y+boxes[b].h/2) || boxes[a].x-boxes[b].x)
-export function category(name:string){if(/^([1-9]m|5mr|0m)$/i.test(name))return '萬子';if(/^([1-9]p|5pr|0p)$/i.test(name))return '筒子';if(/^([1-9]s|5sr|0s)$/i.test(name))return '索子';if(/^(east|south|west|north)$/i.test(name))return '風牌';if(/^(white|green|red)$/i.test(name))return '三元牌';return 'その他'}
+export function category(name:string){if(/^([1-9]m|red5m|5mr|0m)$/i.test(name))return '萬子';if(/^([1-9]p|red5p|5pr|0p)$/i.test(name))return '筒子';if(/^([1-9]s|red5s|5sr|0s)$/i.test(name))return '索子';if(/^(east|south|west|north)$/i.test(name))return '風牌';if(/^(white|green|red)$/i.test(name))return '三元牌';return 'その他'}
 export function groupedClasses(classes:string[]){
  const groups:Record<string,{name:string;id:number}[]>={}
  classes.forEach((name,id)=>{const group=category(name);(groups[group]??=[]).push({name,id})})
  for(const group of ['萬子','筒子','索子'])groups[group]?.sort((a,b)=>tileRank(a.name)-tileRank(b.name)||a.id-b.id)
  return groups
 }
-function tileRank(name:string){return name[0]==='0'?11:Number(name[0])*2+(name.toLowerCase().endsWith('r')?1:0)}
-export function tileName(name:string){return ({east:'東',south:'南',west:'西',north:'北',white:'白',green:'發',red:'中','5mr':'赤5萬','5pr':'赤5筒','5sr':'赤5索','0m':'赤5萬','0p':'赤5筒','0s':'赤5索'} as Record<string,string>)[name.toLowerCase()]||name}
+function tileRank(name:string){return /^(red5.|5.r|0.)$/i.test(name)?11:Number(name[0])*2}
+export function tileName(name:string){return ({east:'東',south:'南',west:'西',north:'北',white:'白',green:'發',red:'中','red5m':'赤5萬','red5p':'赤5筒','red5s':'赤5索','5mr':'赤5萬','5pr':'赤5筒','5sr':'赤5索','0m':'赤5萬','0p':'赤5筒','0s':'赤5索'} as Record<string,string>)[name.toLowerCase()]||name}

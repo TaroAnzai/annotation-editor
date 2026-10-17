@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 from . import core, importer, registry
-from .schema import TILE_CLASSES
+from .schema import TILE_CLASSES, canonical_name, normalize_yolo_yaml
 
 VERSION_PATTERN = re.compile(r"samples\d{8}-\d{2,}$")
 HOST_PATTERN = re.compile(r"(?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]+$")
@@ -125,7 +125,7 @@ def source_manifest(archive: Path):
         classes = json.loads((archive / "meta" / "classes.json").read_text(encoding="utf-8"))
         rows = sorted(classes, key=lambda item: item["yolo_id"])
         if (len(rows) != 37 or [item["yolo_id"] for item in rows] != list(range(37))
-                or any(item["canonical_id"] != i + 1 or item["name"] != TILE_CLASSES[i]
+                or any(item["canonical_id"] != i + 1 or canonical_name(item["name"]) != TILE_CLASSES[i]
                        for i, item in enumerate(rows))):
             raise ValueError("牌クラス定義がcanonical37と一致しません")
         lines = (archive / "meta" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
@@ -163,6 +163,21 @@ def source_manifest(archive: Path):
         return entries
     except (KeyError, TypeError, json.JSONDecodeError, OSError) as error:
         raise ValueError(f"VPS版のmanifestまたはクラス定義が不正です: {error}") from error
+
+def normalize_archive_classes(archive:Path):
+    """Keep the local archive self-consistent after accepting legacy red-five names."""
+    path=archive/'meta'/'classes.json'
+    rows=json.loads(path.read_text(encoding='utf-8'))
+    if not any(canonical_name(row['name'])!=row['name'] for row in rows): return
+    for row in rows: row['name']=canonical_name(row['name'])
+    core.atomic_write(path,(json.dumps(rows,ensure_ascii=False,indent=2)+'\n').encode('utf-8'))
+    checksums=archive/'meta'/'checksums.sha256'
+    lines=checksums.read_text(encoding='utf-8').splitlines()
+    matched=[i for i,line in enumerate(lines) if line.endswith('  meta/classes.json')]
+    if len(matched)!=1: raise ValueError('meta/classes.jsonのチェックサムが一意ではありません')
+    lines[matched[0]]=sha256(path)+'  meta/classes.json'
+    core.atomic_write(checksums,('\n'.join(lines)+'\n').encode('utf-8'))
+    verify(archive,imported=(archive/'labels').is_dir())
 
 
 def remove_original_annotations(source: Path):
@@ -206,6 +221,7 @@ def import_version(host: str, remote_root: str, version: str, progress=None):
         return f"登録済み: {source}"
     copy_version(host, remote_root, str(core.DATA / "sources"), version, progress)
     entries = source_manifest(source)
+    normalize_archive_classes(source)
     marker_path = source / ".vps-source.json"
     if marker_path.exists():
         try:
@@ -228,6 +244,7 @@ def import_version(host: str, remote_root: str, version: str, progress=None):
         marker_path.write_text(
             json.dumps({"version": version, "host": host}, ensure_ascii=False) + "\n",
             encoding="utf-8")
+    normalize_yolo_yaml(source/'data.yaml')
     if progress: progress(3)
     preview = importer.preview(str(source), "register", "real")
     if preview["errors"] or preview["conflicts"]:

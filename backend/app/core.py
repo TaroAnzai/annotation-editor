@@ -78,11 +78,12 @@ def dataset(dataset_id):
 
 def classes(p):
     try:
+        from .schema import canonicalize_names
         y = yaml.safe_load((p/'data.yaml').read_text(encoding='utf-8'))
         names = y['names']
         if isinstance(names, dict): names = [names[i] if i in names else names[str(i)] for i in range(len(names))]
         if not isinstance(names, list) or not names or not all(isinstance(x,str) and x for x in names) or y.get('nc',len(names)) != len(names): raise ValueError('names/ncが不正です')
-        return names
+        return canonicalize_names(names)
     except Exception as e:
         raise HTTPException(422, f'data.yaml読み込みエラー: {e}')
 
@@ -235,7 +236,10 @@ def save(d,p,f,boxes,expected):
     newline='\r\n' if path.exists() and b'\r\n' in path.read_bytes() else '\n'
     lines=[f"{b['class_id']} {b['x']+b['w']/2:.10f} {b['y']+b['h']/2:.10f} {b['w']:.10f} {b['h']:.10f}" for b in boxes]
     content=((newline.join(lines)+newline) if lines else '').encode()
-    if path.exists() and path.read_bytes()==content: return old
+    from .schema import normalize_yolo_yaml
+    if path.exists() and path.read_bytes()==content:
+        normalize_yolo_yaml(safe(DATA/d['yaml_path']) if d.get('yaml_path') else p/'data.yaml')
+        return old
     if path.exists():
         backup=EDITOR/'backups'/path.relative_to(DATA)
         backup=backup.with_name(backup.name+f'.{time.time_ns()}.bak')
@@ -243,6 +247,7 @@ def save(d,p,f,boxes,expected):
         shutil.copy2(path,backup)
     # Validate serialized text before replacing the source.
     parse_label(content.decode(),len(names))
+    normalize_yolo_yaml(safe(DATA/d['yaml_path']) if d.get('yaml_path') else p/'data.yaml')
     atomic_write(path,content)
     set_status(f,'unreviewed' if status_for(f)['status']=='reviewed' else status_for(f)['status'],True)
     return label_info(d,p,f)

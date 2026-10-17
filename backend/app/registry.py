@@ -91,6 +91,68 @@ def list_batches():
             result.append(b)
         return result
 
+def sync_batch_annotations(batch_id:int,progress=None):
+    """Reconcile one registered batch with its current annotation files."""
+    from . import importer
+    with connect() as db:
+        batch=db.execute('SELECT name,path,format FROM batches WHERE id=?',(batch_id,)).fetchone()
+        if not batch: raise ValueError('バッチが見つかりません')
+        registered={r['path']:dict(r) for r in db.execute('''SELECT bi.path,i.sha256,i.source_type,a.id,a.content_json,a.content_sha256,a.revision,a.status
+            FROM batch_images bi JOIN images i ON i.id=bi.image_id
+            JOIN annotations a ON a.batch_id=bi.batch_id AND a.image_id=bi.image_id
+            WHERE bi.batch_id=?''',(batch_id,))}
+    root=path(batch['path'])
+    source_types={r['source_type'] for r in registered.values()}
+    scan=importer.inspect(root,next(iter(source_types)) if len(source_types)==1 else None)
+    if scan['kind']!=batch['format']: raise ValueError('バッチの形式が登録時から変更されています')
+    errors=[e for e in scan['errors'] if not e.startswith('manifestの')]
+    if errors: raise ValueError('アノテーションの検証に失敗しました: '+str(errors))
+    current={rel(Path(r['path'])):r for r in scan['rows']}
+    if set(current)!=set(registered): raise ValueError('登録済み画像と現在の画像が一致しません')
+    if any(r['sha256']!=registered[key]['sha256'] for key,r in current.items()):
+        raise ValueError('登録済み画像と現在の画像の内容が一致しません')
+    if progress: progress(1)
+    # Guard against edits while files are being scanned and while the DB is written.
+    annotation_files={Path(r['annotation_path']) for r in current.values() if r['annotation_path']}
+    annotation_files.update(f for f in (root/'data.yaml',root/'dataset.yaml') if f.is_file())
+    snapshots={f:sha(f) for f in annotation_files}
+    rescanned=importer.inspect(root,next(iter(source_types)) if len(source_types)==1 else None)
+    if [e for e in rescanned['errors'] if not e.startswith('manifestの')] or {
+        rel(Path(r['path'])):(r['sha256'],r['annotation_path'],box_digest(r['boxes'])) for r in rescanned['rows']
+    }!={key:(r['sha256'],r['annotation_path'],box_digest(r['boxes'])) for key,r in current.items()}:
+        raise ValueError('同期中にアノテーションファイルが変更されました')
+    changed=review_reset=0
+    with connect() as db:
+        if any(sha(f)!=digest for f,digest in snapshots.items()):
+            raise ValueError('同期中にアノテーションファイルが変更されました')
+        for key,r in current.items():
+            old=registered[key]
+            if sha(path(key))!=old['sha256']: raise ValueError(f'同期中に画像が変更されました: {key}')
+            latest=db.execute('SELECT content_sha256,revision,status FROM annotations WHERE id=?',(old['id'],)).fetchone()
+            if not latest or tuple(latest)!=(old['content_sha256'],old['revision'],old['status']):
+                raise ValueError(f'同期中にDBのアノテーションが変更されました: {key}')
+            boxes=r['boxes'];digest_now=box_digest(boxes)
+            if digest_now==old['content_sha256']: continue
+            previous=json.loads(old['content_json'])
+            equivalent=(len(previous)==len(boxes) and all(
+                a['class_id']==b['class_id'] and all(abs(a[k]-b[k])<=1e-8 for k in ('x','y','w','h'))
+                for a,b in zip(previous,boxes)))
+            new_status=old['status'] if equivalent else ('unannotated' if not boxes else 'unreviewed')
+            timestamp=now();revision=old['revision']+1
+            db.execute('''UPDATE annotations SET content_json=?,content_sha256=?,revision=?,status=?,reviewed_at=CASE WHEN ? THEN reviewed_at ELSE NULL END,updated_at=? WHERE id=?''',
+                       (json.dumps(boxes),digest_now,revision,new_status,equivalent,timestamp,old['id']))
+            db.execute('INSERT INTO annotation_history(annotation_id,revision,content_sha256,changed_at) VALUES(?,?,?,?)',
+                       (old['id'],revision,digest_now,timestamp))
+            if new_status!=old['status']:
+                db.execute('INSERT INTO status_history(annotation_id,old_status,new_status,changed_at) VALUES(?,?,?,?)',
+                           (old['id'],old['status'],new_status,timestamp))
+            changed+=1
+            if old['status']=='reviewed' and new_status!='reviewed': review_reset+=1
+        if any(sha(f)!=digest for f,digest in snapshots.items()):
+            raise ValueError('同期中にアノテーションファイルが変更されました')
+    if progress: progress(2)
+    return f"{batch['name']}: DBのアノテーション {changed} 枚を更新、再確認が必要 {review_reset} 枚"
+
 def confirm_batch(batch_id:int,progress=None):
     from . import versions
     rows=versions.rows_from_db([batch_id],require_review=False)

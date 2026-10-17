@@ -96,7 +96,7 @@ def test_imports_vps_version_as_editable_provisional_source(tmp_path, monkeypatc
     (archive / "annotations" / "yolo" / f"{sample}.txt").write_text("0 0.5 0.5 0.4 0.4\n")
     (archive / "meta" / "source" / f"{sample}.json").write_text("{}")
     (archive / "meta" / "classes.json").write_text(json.dumps([
-        {"canonical_id": i + 1, "name": name, "yolo_id": i}
+        {"canonical_id": i + 1, "name": {'red5m':'5mr','red5p':'5pr','red5s':'5sr'}.get(name,name), "yolo_id": i}
         for i, name in enumerate(TILE_CLASSES)
     ]))
     (archive / "dataset.yaml").write_text(f"name: {version}\nformat: yolo\nclass_schema: canonical37\n")
@@ -128,6 +128,8 @@ def test_imports_vps_version_as_editable_provisional_source(tmp_path, monkeypatc
     assert (source / "labels" / f"{sample}.txt").read_text() == "0 0.5 0.5 0.4 0.4\n"
     assert not (source / "annotations").exists()
     assert (source / "meta" / "source" / f"{sample}.json").exists()
+    assert [row['name'] for row in json.loads((source/'meta'/'classes.json').read_text())][-3:]==['red5m','red5p','red5s']
+    assert core.classes(source)[-3:]==['red5m','red5p','red5s']
     assert any(item["path"] == f"sources/{version}" and item["editable"] for item in core.datasets())
     with registry.connect() as db:
         row = db.execute("SELECT status FROM annotations").fetchone()

@@ -4,6 +4,9 @@ from PIL import Image
 from fastapi import HTTPException
 from app import core
 from app import main
+from app import schema, versions
+from app import importer
+import json
 
 @pytest.fixture
 def sample(tmp_path,monkeypatch):
@@ -76,6 +79,10 @@ def test_paths_and_api(sample,tmp_path):
     with pytest.raises(HTTPException):main.image('not-an-id')
     assert main.health()['ok']
 
+def test_version_job_result_is_a_short_summary():
+    result={'id':'v003','manifest':{'splits':{'train':{'image_count':2226},'val':{'image_count':270},'test':{'image_count':230}},'leaf_sources':[{'source_name':'very long manifest'}]}}
+    assert main.job_result_text('version',result)=='v003 を作成しました（train 2226 / val 270 / test 230 枚）'
+
 def test_missing_label_and_status_api(sample):
     p,_=sample;ds=core.datasets()[0];rows=core.images(ds['id']);id=rows[1]['id']
     assert main.annotations(id)['boxes']==[]
@@ -97,3 +104,68 @@ def test_standard_split_and_read_only(tmp_path,monkeypatch):
     assert edit['path']=='standard/train' and core.classes_for(edit,train)==['1m']
     assert core.images(edit['id'])[0]['name']=='tile.png'
     assert core.images(view['id'])[0]['name']=='view.jpg'
+
+def test_legacy_yolo_names_are_read_and_saved_canonically(sample):
+    p,_=sample
+    names=list(schema.TILE_CLASSES)
+    names[34:]=['5mr','5pr','5sr']
+    (p/'data.yaml').write_text('nc: 37\nnames: '+json.dumps(names)+'\n')
+    (p/'dataset.yaml').write_text('class_mapping: '+json.dumps(dict(zip(names,schema.TILE_CLASSES)))+'\n')
+    label=p/'labels'/'2.txt'
+    label.write_text('34 0.5 0.5 0.2 0.4\n')
+    d=core.datasets()[0];f=p/'images'/'2.jpg'
+    assert core.classes_for(d,p)[34:]==['red5m','red5p','red5s']
+    old=core.label_info(d,p,f)
+    core.save(d,p,f,old['boxes'],old['version'])
+    assert '5mr' not in (p/'data.yaml').read_text()
+    assert core.classes(p)[34:]==['red5m','red5p','red5s']
+    assert '5mr' not in (p/'dataset.yaml').read_text()
+    assert importer.mapping(p,core.classes(p))[34]==34
+    assert label.read_text().split()[0]=='34'
+
+def test_legacy_coco_save_normalizes_all_categories_and_keeps_ids(tmp_path,monkeypatch):
+    data=tmp_path/'data';p=data/'sources'/'legacy';(p/'annotations').mkdir(parents=True);(p/'images').mkdir()
+    monkeypatch.setattr(core,'DATA',data)
+    image=p/'images'/'one.png';Image.new('RGB',(100,100)).save(image)
+    categories=[dict(c) for c in schema.CATEGORIES]
+    categories[34]['name']='5mr';categories[35]['name']='5pr';categories[36]['name']='5sr'
+    path=p/'annotations'/'instances.json'
+    path.write_text(json.dumps({'images':[{'id':1,'file_name':'one.png','width':100,'height':100}],
+                                'annotations':[{'id':1,'image_id':1,'category_id':35,'bbox':[10,10,20,20],'area':400,'iscrowd':0}],
+                                'categories':categories}))
+    boxes=schema.coco_boxes(path,image)
+    assert boxes[0]['class_id']==34
+    schema.save_coco(path,image,boxes,core.version(path))
+    value=json.loads(path.read_text())
+    assert value['categories']==schema.CATEGORIES
+    assert value['annotations'][0]['category_id']==35
+    assert schema.coco_boxes(path,image)==boxes
+
+def test_version_normalization_updates_hash_without_changing_tile(tmp_path):
+    root=tmp_path/'version';(root/'annotations').mkdir(parents=True)
+    categories=[dict(c) for c in schema.CATEGORIES]
+    categories[34]['name']='5mr'
+    coco={'images':[],'annotations':[{'id':1,'image_id':1,'category_id':35}], 'categories':categories}
+    path=root/'annotations'/'instances.json';path.write_text(json.dumps(coco))
+    manifest={'annotation_sha256':versions.jd(coco)}
+    (root/'manifest.json').write_text(json.dumps(manifest))
+    versions.normalize_version_payload(root)
+    result=json.loads(path.read_text());updated=json.loads((root/'manifest.json').read_text())
+    assert result['categories'][34]['name']=='red5m'
+    assert result['annotations'][0]['category_id']==35
+    assert updated['annotation_sha256']==versions.jd(result)
+
+def test_version_normalization_remaps_noncanonical_category_ids(tmp_path):
+    root=tmp_path/'version';(root/'annotations').mkdir(parents=True)
+    categories=[dict(c) for c in schema.CATEGORIES]
+    categories[0]['name']='5mr';categories[34]['name']='1m'
+    mapping={c['name']:schema.canonical_name(c['name']) for c in categories}
+    import yaml
+    (root/'dataset.yaml').write_text(yaml.safe_dump({'class_mapping':mapping}))
+    coco={'images':[],'annotations':[{'id':1,'image_id':1,'category_id':1}], 'categories':categories}
+    path=root/'annotations'/'instances.json';path.write_text(json.dumps(coco))
+    (root/'manifest.json').write_text(json.dumps({'annotation_sha256':versions.jd(coco)}))
+    versions.normalize_version_payload(root)
+    result=json.loads(path.read_text())
+    assert result['categories']==schema.CATEGORIES
+    assert result['annotations'][0]['category_id']==35

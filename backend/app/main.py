@@ -41,9 +41,19 @@ class ReferenceVersionBody(BaseModel):
     reference_path:str
     description:str=''
 pool=ThreadPoolExecutor(max_workers=2)
+def job_result_text(kind,result):
+    if kind in ('version','unpartitioned','reference') and isinstance(result,dict) and result.get('id'):
+        manifest=result.get('manifest') or {}
+        splits=manifest.get('splits') or result.get('counts') or {}
+        if splits:
+            counts={name:value.get('image_count',0) if isinstance(value,dict) else value for name,value in splits.items()}
+            return f"{result['id']} を作成しました（train {counts.get('train',0)} / val {counts.get('val',0)} / test {counts.get('test',0)} 枚）"
+        if 'image_count' in result: return f"{result['id']} を作成しました（画像 {result['image_count']} 枚）"
+        return f"{result['id']} を作成しました"
+    return str(result)
 def job(kind,fn,*args,**kwargs):
     key=uuid4().hex
-    total={'import':3,'import_version':3,'version':6,'reference':6,'unpartitioned':3,'confirm_batch':2,'archive':2,'upload':3,'vps_import':5}.get(kind,1)
+    total={'import':3,'import_version':3,'version':6,'reference':6,'unpartitioned':3,'confirm_batch':2,'sync_batch':2,'archive':2,'upload':3,'vps_import':5}.get(kind,1)
     with registry.connect() as db: db.execute('INSERT INTO jobs(id,kind,status,progress,total,updated_at) VALUES(?,?,?,?,?,?)',(key,kind,'queued',0,total,registry.now()))
     def run():
         def progress(n):
@@ -51,7 +61,7 @@ def job(kind,fn,*args,**kwargs):
         with registry.connect() as db: db.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?",(registry.now(),key))
         try:
             result=fn(*args,**kwargs,progress=progress)
-            with registry.connect() as db: db.execute("UPDATE jobs SET status='complete',progress=?,result=?,updated_at=? WHERE id=?",(total,str(result),registry.now(),key))
+            with registry.connect() as db: db.execute("UPDATE jobs SET status='complete',progress=?,result=?,updated_at=? WHERE id=?",(total,job_result_text(kind,result),registry.now(),key))
         except Exception as e:
             with registry.connect() as db: db.execute("UPDATE jobs SET status='failed',error=?,updated_at=? WHERE id=?",(str(e),registry.now(),key))
     pool.submit(run)
@@ -85,7 +95,7 @@ def annotations(image_id:str):
     d,p,f=core.image(image_id);return core.label_info(d,p,f)
 @app.put('/api/images/{image_id}/annotations')
 def save_annotations(image_id:str,body:SaveBody):
-    d,p,f=core.image(image_id);result=core.save(d,p,f,body.boxes,body.version);registry.annotation_saved(f,body.boxes);return result
+    d,p,f=core.image(image_id);result=core.save(d,p,f,body.boxes,body.version);registry.annotation_saved(f,result['boxes']);return result
 @app.put('/api/images/{image_id}/status')
 def status(image_id:str,body:StatusBody):
     d,_,f=core.image(image_id)
@@ -96,6 +106,8 @@ def status(image_id:str,body:StatusBody):
 def batches(): return registry.list_batches()
 @app.post('/api/manage/batches/{batch_id}/confirm')
 def batch_confirm(batch_id:int): return job('confirm_batch',registry.confirm_batch,batch_id)
+@app.post('/api/manage/batches/{batch_id}/sync')
+def batch_sync(batch_id:int): return job('sync_batch',registry.sync_batch_annotations,batch_id)
 @app.get('/api/manage/analysis')
 def analysis(): return registry.analysis()
 @app.get('/api/manage/vps/defaults')

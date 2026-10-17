@@ -3,7 +3,7 @@ from __future__ import annotations
 import json, shutil, tempfile, random, hashlib, re
 from pathlib import Path
 from . import core, registry as reg, importer
-from .schema import CATEGORIES, validate_coco
+from .schema import CATEGORIES, validate_coco, category_mapping, normalize_mapping_config
 
 SPLITS=('train','val','test')
 def jd(v): return 'sha256:'+reg.digest(v)
@@ -126,11 +126,12 @@ def facts(root,split,source_id,leaf_sources,preserved=False):
     coco=json.loads((root/split/'labels'/'instances.json').read_text())
     files=sorted((p.name,reg.sha(p)) for p in (root/split/'images').iterdir() if p.is_file())
     return {'source_dataset_id':source_id,'leaf_sources':leaf_sources,'preserved':preserved,'image_count':len(coco['images']),'annotation_count':len(coco['annotations']),'source_type_summary':{t:sum(i['source_type']==t for i in coco['images']) for t in ('synthetic','real')},'annotation_sha256':jd(coco),'image_inventory_sha256':jd(files)}
-def validate(root:Path):
+def validate(root:Path,allow_legacy=False):
     if (root/'manifest.json').is_file() and not (root/'dataset_manifest.json').exists():
         manifest=json.loads((root/'manifest.json').read_text())
         coco=json.loads((root/'annotations'/'instances.json').read_text())
-        validate_coco(coco,root/'images')
+        validate_coco(coco,root/'images',require_canonical=not allow_legacy)
+        if allow_legacy: category_mapping(root/'annotations'/'instances.json',coco)
         inventory=sorted((p.name,reg.sha(p)) for p in (root/'images').iterdir() if p.is_file())
         if manifest.get('image_count')!=len(coco['images']) or manifest.get('annotation_count')!=len(coco['annotations']) or manifest.get('annotation_sha256')!=jd(coco) or manifest.get('image_inventory_sha256')!=jd(inventory): raise ValueError('未分割バージョンのmanifestが不一致です')
         return {'valid':True,'kind':'unpartitioned','count':len(coco['images']),'dataset_id':manifest['dataset_id']}
@@ -138,7 +139,8 @@ def validate(root:Path):
     found={}; hashes=set()
     for split in SPLITS:
         p=root/split/'labels'/'instances.json';coco=json.loads(p.read_text())
-        validate_coco(coco,root/split/'images')
+        validate_coco(coco,root/split/'images',require_canonical=not allow_legacy)
+        if allow_legacy: category_mapping(p,coco)
         fact=manifest['splits'][split]
         actual=facts(root,split,fact['source_dataset_id'],fact['leaf_sources'],fact.get('preserved',False))
         if any(actual[k]!=fact[k] for k in ('image_count','annotation_count','source_type_summary','annotation_sha256','image_inventory_sha256')): raise ValueError(f'{split}のmanifestが不一致です')
@@ -149,6 +151,36 @@ def validate(root:Path):
         found[split]=actual
     if jd({'splits':{s:{k:found[s][k] for k in ('source_dataset_id','image_inventory_sha256','annotation_sha256')} for s in SPLITS}})!=manifest['dataset_id']: raise ValueError('dataset_idが不一致です')
     return {'valid':True,'counts':{s:found[s]['image_count'] for s in SPLITS},'dataset_id':manifest['dataset_id']}
+
+def normalize_version_payload(root:Path):
+    """Write canonical category IDs/names and refresh dependent manifest hashes."""
+    merged=(root/'manifest.json').is_file() and not (root/'dataset_manifest.json').exists()
+    paths=[root/'annotations'/'instances.json'] if merged else [root/s/'labels'/'instances.json' for s in SPLITS]
+    changed=False
+    for path in paths:
+        value=json.loads(path.read_text(encoding='utf-8'))
+        mapping=category_mapping(path,value)
+        if len(mapping)!=37 or len(set(mapping.values()))!=37: raise ValueError('カテゴリの対応が一対一ではありません')
+        if any(c['name']!=CATEGORIES[c['id']-1]['name'] for c in value['categories'] if c['id'] in range(1,38)) or any(k!=v+1 for k,v in mapping.items()):
+            for ann in value['annotations']: ann['category_id']=mapping[ann['category_id']]+1
+            value['categories']=[dict(c) for c in CATEGORIES]
+            write_json(path,value)
+            changed=True
+    if merged:
+        path=root/'manifest.json';manifest=json.loads(path.read_text(encoding='utf-8'))
+        digest=jd(json.loads((root/'annotations'/'instances.json').read_text(encoding='utf-8')))
+        previous=manifest.get('annotation_sha256')
+        manifest['annotation_sha256']=digest
+        if changed or previous!=digest:
+            write_json(path,manifest)
+    else:
+        path=root/'dataset_manifest.json';manifest=json.loads(path.read_text(encoding='utf-8'))
+        for split in SPLITS:
+            manifest['splits'][split]['annotation_sha256']=jd(json.loads((root/split/'labels'/'instances.json').read_text(encoding='utf-8')))
+        manifest['dataset_id']=jd({'splits':{s:{k:manifest['splits'][s][k] for k in ('source_dataset_id','image_inventory_sha256','annotation_sha256')} for s in SPLITS}})
+        if changed or json.loads(path.read_text(encoding='utf-8'))!=manifest:
+            write_json(path,manifest)
+    normalize_mapping_config(root/'dataset.yaml')
 
 def create(parent=None,batch_ids=None,image_ids=None,test_real=0,test_synthetic=0,val_ratio=.1,seed=42,keep_test=True,description='',progress=None):
     with reg.connect() as db:
@@ -210,7 +242,7 @@ def create_from_reference(parent:str, reference_path:str, description:str='', pr
     if reference.is_symlink() or not reference.is_dir(): raise ValueError('参照datasetフォルダーがありません')
     reference=reference.resolve()
     if any(p.is_symlink() for p in reference.rglob('*')): raise ValueError('参照datasetにシンボリックリンクがあります')
-    reference_result=validate(reference)
+    reference_result=validate(reference,allow_legacy=True)
     if progress: progress(1)
     with reg.connect() as db:
         parent_info=db.execute('SELECT kind FROM versions WHERE id=?',(parent,)).fetchone()
@@ -231,12 +263,15 @@ def create_from_reference(parent:str, reference_path:str, description:str='', pr
     for split in SPLITS:
         coco=json.loads((reference/split/'labels'/'instances.json').read_text(encoding='utf-8'))
         split_documents[split]=coco
+        class_map=category_mapping(reference/split/'labels'/'instances.json',coco)
         images={image['id']:image for image in coco['images']}
         annotations={image_id:[] for image_id in images}
         for annotation in coco['annotations']:
             image=images[annotation['image_id']]
             x,y,w,h=annotation['bbox']
-            annotations[image['id']].append({'class_id':annotation['category_id']-1,'x':x/image['width'],'y':y/image['height'],'w':w/image['width'],'h':h/image['height']})
+            annotations[image['id']].append({'class_id':class_map[annotation['category_id']],'x':x/image['width'],'y':y/image['height'],'w':w/image['width'],'h':h/image['height']})
+            annotation['category_id']=class_map[annotation['category_id']]+1
+        coco['categories']=[dict(c) for c in CATEGORIES]
         for image in coco['images']:
             name=Path(image['file_name'])
             if len(name.parts)!=1: raise ValueError(f'参照datasetの画像名が不正です: {name}')
@@ -266,9 +301,11 @@ def create_from_reference(parent:str, reference_path:str, description:str='', pr
         manifest={**reference_manifest,'created_at':reg.now(),'parent_version':parent,'description':description,
                   'fixed_test':True,'reference_dataset_id':reference_result['dataset_id']}
         write_json(staged/'dataset_manifest.json',manifest)
+        normalize_version_payload(staged)
+        manifest=json.loads((staged/'dataset_manifest.json').read_text(encoding='utf-8'))
         result=validate(staged)
-        if result['dataset_id']!=reference_result['dataset_id']:
-            raise ValueError('参照datasetとdataset_idが一致しません')
+        if result['dataset_id']!=manifest['dataset_id']:
+            raise ValueError('正規化後のdataset_idが一致しません')
         test=manifest['splits']['test']
         test_id=jd({'annotation':test['annotation_sha256'],'images':test['image_inventory_sha256']})
         staged.replace(target)
@@ -305,12 +342,15 @@ def import_version(value:str,mode:str,name:str,source_type=None,expected=None,pr
             payload.mkdir()
             for split in SPLITS: shutil.copytree(root/split,payload/split)
             shutil.copy2(root/'dataset_manifest.json',payload/'dataset_manifest.json')
+            if (root/'dataset.yaml').is_file(): shutil.copy2(root/'dataset.yaml',payload/'dataset.yaml')
         else: shutil.copytree(root,payload)
+        normalize_version_payload(payload)
         copied=importer.inspect(payload,source_type)
         if [(r['rel'],r['sha256']) for r in copied['rows']]!=[(r['rel'],r['sha256']) for r in scan['rows']]: raise ValueError('コピー検証失敗')
         payload.replace(target);installed=True
         if progress: progress(2)
-        manifest=scan['manifest'] or {};kind='merged' if scan['kind']=='merged' else 'completed'
+        manifest_path=target/('manifest.json' if scan['kind']=='merged' else 'dataset_manifest.json')
+        manifest=json.loads(manifest_path.read_text(encoding='utf-8'));kind='merged' if scan['kind']=='merged' else 'completed'
         if kind=='completed': validate(target)
         test_id=None
         if kind=='completed':

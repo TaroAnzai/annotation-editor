@@ -7,15 +7,71 @@ import yaml
 
 TILE_CLASSES = tuple(f'{rank}{suit}' for suit in 'mps' for rank in range(1, 10)) + ('east','south','west','north','white','green','red','red5m','red5p','red5s')
 CATEGORIES = [{'id': i, 'name': name} for i,name in enumerate(TILE_CLASSES,1)]
+LEGACY_NAMES = {'5mr':'red5m','5pr':'red5p','5sr':'red5s','0m':'red5m','0p':'red5p','0s':'red5s'}
+def canonical_name(name): return LEGACY_NAMES.get(name,name)
+def canonicalize_names(names):
+    normalized=[canonical_name(name) for name in names]
+    if len(normalized)!=len(set(normalized)):
+        raise ValueError('正規化後にクラス名が重複します')
+    return normalized
+
+def normalize_yolo_yaml(path:Path):
+    """Canonicalize names at their existing indices; numeric YOLO labels stay valid."""
+    from . import core
+    data=yaml.safe_load(path.read_text(encoding='utf-8'))
+    names=data['names']
+    if isinstance(names,list):
+        normalized=canonicalize_names(names)
+        if normalized==names:
+            normalize_mapping_config(path.parent/'dataset.yaml')
+            return False
+        data['names']=normalized
+    elif isinstance(names,dict):
+        normalized=canonicalize_names([names[i] if i in names else names[str(i)] for i in range(len(names))])
+        if normalized==list(names.values()):
+            normalize_mapping_config(path.parent/'dataset.yaml')
+            return False
+        data['names']={key:normalized[int(key)] for key in names}
+    else: raise ValueError('data.yamlのnamesが不正です')
+    if data.get('nc',len(normalized))!=len(normalized): raise ValueError('data.yamlのncが不正です')
+    core.atomic_write(path,yaml.safe_dump(data,allow_unicode=True,sort_keys=False).encode('utf-8'))
+    normalize_mapping_config(path.parent/'dataset.yaml')
+    return True
+
+def normalize_mapping_config(config:Path):
+    from . import core
+    if not config.is_file(): return
+    data=yaml.safe_load(config.read_text(encoding='utf-8')) or {}
+    if not data.get('class_mapping'): return
+    old=data['class_mapping']
+    mapping={canonical_name(k):canonical_name(v) for k,v in old.items()}
+    if len(mapping)!=len(old): raise ValueError('正規化後にclass_mappingが重複します')
+    if mapping!=old:
+        data['class_mapping']=mapping
+        core.atomic_write(config,yaml.safe_dump(data,allow_unicode=True,sort_keys=False).encode('utf-8'))
 def canonical_names(): return TILE_CLASSES
 
 def category_mapping(path:Path,value):
-    names={int(c['id']):c['name'] for c in value['categories']}
+    names={int(c['id']):canonical_name(c['name']) for c in value['categories']}
     if names=={c['id']:c['name'] for c in CATEGORIES}: return {i:i-1 for i in names}
     config=next((p for p in (path.parent/'dataset.yaml',path.parent.parent/'dataset.yaml',path.parent.parent.parent/'dataset.yaml') if p.is_file()),None)
     specified=(yaml.safe_load(config.read_text()) or {}).get('class_mapping') if config else None
-    if not specified or set(specified)!=set(names.values()) or len(specified)!=37 or set(specified.values())!=set(TILE_CLASSES): raise HTTPException(422,'COCOクラスには37クラスの明示的なmappingが必要です')
-    return {i:TILE_CLASSES.index(specified[n]) for i,n in names.items()}
+    raw_names={int(c['id']):c['name'] for c in value['categories']}
+    if not specified or set(specified)!=set(raw_names.values()) or len(specified)!=37 or set(canonical_name(n) for n in specified.values())!=set(TILE_CLASSES): raise HTTPException(422,'COCOクラスには37クラスの明示的なmappingが必要です')
+    return {i:TILE_CLASSES.index(canonical_name(specified[n])) for i,n in raw_names.items()}
+
+def canonicalize_coco(value, path):
+    """Rename categories in place, retaining their IDs and all annotation references."""
+    mapping=category_mapping(path,value)
+    if len(mapping)!=len(TILE_CLASSES) or len(set(mapping.values()))!=len(TILE_CLASSES):
+        raise ValueError('COCOカテゴリが37クラスの一対一対応ではありません')
+    for category in value['categories']:
+        category['name']=TILE_CLASSES[mapping[int(category['id'])]]
+    return value
+
+def normalize_coco_mapping(path:Path):
+    config=next((p for p in (path.parent/'dataset.yaml',path.parent.parent/'dataset.yaml',path.parent.parent.parent/'dataset.yaml') if p.is_file()),None)
+    if config: normalize_mapping_config(config)
 
 def read_coco(path:Path):
     try:
@@ -58,6 +114,7 @@ def save_coco(path:Path,image:Path,boxes,expected):
     if core.version(path)!=expected: raise HTTPException(409,'COCOが外部で変更されました')
     value=validate_coco(read_coco(path),require_canonical=False)
     reverse={v:k for k,v in category_mapping(path,value).items()}
+    canonicalize_coco(value,path)
     matches=[i for i in value['images'] if Path(i['file_name']).name==image.name]
     if len(matches)!=1: raise HTTPException(422,'COCO画像対応が一意ではありません')
     record=matches[0]; old=[a for a in value['annotations'] if a['image_id']==record['id']]
@@ -74,4 +131,5 @@ def save_coco(path:Path,image:Path,boxes,expected):
         backup=backup.with_name(backup.name+f'.{time.time_ns()}.bak'); backup.parent.mkdir(parents=True,exist_ok=True)
         shutil.copy2(path,backup)
         core.atomic_write(path,raw)
-    return {'boxes':boxes,'version':core.version(path),'error':None}
+    normalize_coco_mapping(path)
+    return {'boxes':coco_boxes(path,image),'version':core.version(path),'error':None}

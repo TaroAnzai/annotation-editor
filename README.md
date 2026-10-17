@@ -39,7 +39,7 @@ cd frontend && npm install && cd ..
 - **移動**: 明示的に選んだ場合だけ、一時複製・検証・DB登録後に指定元を削除します。競合画像を除外した場合は元画像を守るため、元フォルダー全体を残します。
 - **sources内を登録**: `../data/sources/<バッチ名>` に手動配置したフォルダーをそのまま登録します。同じバッチの再登録は冪等です。
 
-対応形式は画像のみ、YOLO Detection、COCO Detection、Roboflow YOLO/COCO、`mahjong-tile-ai` prepared、merged、完成datasetです。画像のみの取り込み後はエディターでBBoxを追加できます。YOLOの `data.yaml` は37クラスの `names` が必要です。標準名、Roboflowの `5mr/5pr/5sr`、または `dataset.yaml` の完全な `class_mapping` を検証します。COCOもcanonical37以外は完全なmappingを要求します。クラスを推測しません。YOLO class IDは0～36、学習用COCO category IDは1～37です。0は学習モデル内部のbackgroundです。
+対応形式は画像のみ、YOLO Detection、COCO Detection、Roboflow YOLO/COCO、`mahjong-tile-ai` prepared、merged、完成datasetです。画像のみの取り込み後はエディターでBBoxを追加できます。YOLOの `data.yaml` は37クラスの `names` が必要です。正規名は `red5m/red5p/red5s` です。旧名 `5mr/5pr/5sr` と `0m/0p/0s` は読み込み時に対応し、取り込み先・編集保存先・新規バージョンのクラス定義は正規名で書きます。既存のクラスIDは変更せず、完全な `class_mapping` がある場合は対応関係も正規化します。COCOも37クラス以外は完全なmappingを要求します。クラスを推測しません。YOLO class IDは0～36、学習用COCO category IDは1～37です。0は学習モデル内部のbackgroundです。
 
 混在バッチではCOCO画像レコードの `source_type`、またはルートの `source_types.json` に `{"images/a.jpg":"real","images/b.jpg":"synthetic"}` と書けます。欠けた画像種類には画面の選択値を使います。
 
@@ -58,6 +58,8 @@ VPSの版一覧を取得できた接続先と保存ルートはブラウザの `
 編集画面ではBBoxの追加、移動、サイズ変更、牌種変更、削除、Undo/Redo、拡大縮小、前後移動、キーボード操作を利用できます。未保存変更のまま画面を切り替えると確認が出ます。YOLOは従来どおり `.txt` に保存します。COCOは元JSON内の対象画像のannotationだけ更新し、`bbox`、`area`、一意のannotation IDを保存します。両形式とも保存前バックアップ、外部更新との競合検出、原子的置換を使います。元画像は更新しません。
 
 状態は未アノテーション、仮アノテーション、未確認、確認済み、保留です。既存の `unreviewed/reviewed/held` も使用できます。YOLO取り込みは仮アノテーション、COCO取り込みは未確認から始まり、自動で確認済みにはなりません。「確認済み・次へ」で確認します。確認済みのannotationを保存し直すと未確認に戻ります。バージョン作成時は確認済みだけ選ばれます。
+
+データ管理の各バッチにある「アノテーションでDBを更新」は、現在のラベルファイルを検証して登録済みDBのBBoxを同期します。内容が変わった画像は未確認に戻り、丸め誤差だけの更新では確認状態を維持します。画像の増減や不正なラベルがある場合は、DBを変更せずに失敗します。
 
 全件確認などの処理中は画面を切り替えられます。処理はバックエンドで継続し、同じタブでデータ管理画面へ戻ると進捗と完了・失敗結果を再表示します。全件確認中にannotationが変更された場合は一括更新を取り消します。完成バージョン作成、既存datasetと同じ分割での完成バージョン作成、未分割バージョン作成中は進捗モーダルが表示され、完了または失敗までアプリ内の画面切り替えと他の操作ができません。ブラウザを再読み込みした場合も同じタブで進捗表示を復元します。
 
