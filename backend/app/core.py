@@ -190,7 +190,12 @@ def parse_label(raw, nclasses):
             if str(cid)!=parts[0] or not 0<=cid<nclasses: raise ValueError('クラスIDが不正です')
             x,y,w,h=vals
             if not all(0<=v<=1 for v in vals) or w<=0 or h<=0 or x-w/2 < -1e-8 or y-h/2 < -1e-8 or x+w/2 > 1+1e-8 or y+h/2 > 1+1e-8: raise ValueError('BBox座標が不正です')
-            rows.append({'class_id':cid,'x':x-w/2,'y':y-h/2,'w':w,'h':h})
+            left,top,right,bottom=x-w/2,y-h/2,x+w/2,y+h/2
+            if left<0: w+=left;left=0
+            if top<0: h+=top;top=0
+            if right>1: w-=right-1
+            if bottom>1: h-=bottom-1
+            rows.append({'class_id':cid,'x':left,'y':top,'w':w,'h':h})
         except Exception as e: raise HTTPException(422,f'ラベル {line_num}行目: {e}')
     return rows
 

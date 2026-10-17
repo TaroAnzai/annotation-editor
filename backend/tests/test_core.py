@@ -32,6 +32,17 @@ def test_yaml_and_parse(sample):
     with pytest.raises(HTTPException):core.parse_label('0 .01 .5 .2 .4',2)
     with pytest.raises(HTTPException):core.validate_boxes([{'class_id':3,'x':0,'y':0,'w':.1,'h':.1}],2)
 
+def test_parse_label_clips_rounding_at_image_edges():
+    raw='31 0.31959133 0.03753988 0.09069734 0.07507977\n31 0.22386191 0.96275249 0.08801044 0.07449503\n27 0.56967514 0.75024939 0.86064973 0.33559017\n'
+    boxes=core.parse_label(raw,37)
+    core.validate_boxes(boxes,37)
+    assert boxes[0]['y']==0
+    assert boxes[1]['y']+boxes[1]['h']==pytest.approx(1)
+    assert boxes[2]['x']+boxes[2]['w']==pytest.approx(1)
+    assert boxes[0]['h']==pytest.approx(0.075079765)
+    with pytest.raises(HTTPException,match='BBox座標が不正です'):
+        core.parse_label('31 0.32 0.03 0.09 0.07',37)
+
 def test_save_backup_conflict_status(sample):
     p,editor=sample;d=core.datasets()[0];f=p/'images'/'2.jpg';v=core.label_info(d,p,f)['version']
     old=(p/'labels'/'2.txt').read_bytes();b=[{'class_id':1,'x':.2,'y':.3,'w':.2,'h':.4}]

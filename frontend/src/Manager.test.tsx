@@ -3,7 +3,72 @@ import {afterEach,expect,it,vi} from 'vitest'
 import {cleanup,fireEvent,render,waitFor} from '@testing-library/react'
 import Manager from './Manager'
 
-afterEach(()=>{cleanup();sessionStorage.removeItem('mahjong-annotation-editor-active-job');sessionStorage.removeItem('mahjong-annotation-editor-blocking-job');vi.unstubAllGlobals()})
+afterEach(()=>{cleanup();sessionStorage.removeItem('mahjong-annotation-editor-active-job');sessionStorage.removeItem('mahjong-annotation-editor-blocking-job');localStorage.removeItem('mahjong-annotation-editor-vps-connection');vi.unstubAllGlobals()})
+
+it('remembers a successful VPS connection and prefers it over backend defaults',async()=>{
+ let reject=false
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(url==='/api/manage/vps/versions'&&init?.method==='POST'){
+   if(reject)return {ok:false,status:422,statusText:'Unprocessable Entity',json:async()=>({detail:'接続できません'})}
+   return {ok:true,json:async()=>({versions:[]})}
+  }
+  return {ok:true,json:async()=>url==='/api/manage/vps/defaults'?{host:'default-host',remote_root:'/default',source_root:'/data/sources'}:url==='/api/manage/batches'||url==='/api/manage/versions'?[]:{}}
+ }))
+ const first=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(first.getByText('VPSから取得'))
+ await waitFor(()=>expect((first.getByLabelText('SSH接続先') as HTMLInputElement).value).toBe('default-host'))
+ fireEvent.change(first.getByLabelText('SSH接続先'),{target:{value:'vps'}})
+ fireEvent.change(first.getByLabelText('VPSの保存ルート'),{target:{value:'/srv/samples/'}})
+ fireEvent.click(first.getByText('完成済みの版を一覧表示'))
+ await waitFor(()=>expect(JSON.parse(localStorage.getItem('mahjong-annotation-editor-vps-connection')||'null')).toEqual({host:'vps',remote_root:'/srv/samples/'}))
+ reject=true
+ fireEvent.change(first.getByLabelText('SSH接続先'),{target:{value:'wrong-host'}})
+ fireEvent.click(first.getByText('完成済みの版を一覧表示'))
+ await waitFor(()=>expect(first.getByText(/接続できません/)).toBeTruthy())
+ expect(JSON.parse(localStorage.getItem('mahjong-annotation-editor-vps-connection')||'null')).toEqual({host:'vps',remote_root:'/srv/samples/'})
+ first.unmount()
+ const second=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(second.getByText('VPSから取得'))
+ await waitFor(()=>expect((second.getByLabelText('SSH接続先') as HTMLInputElement).value).toBe('vps'))
+ expect((second.getByLabelText('VPSの保存ルート') as HTMLInputElement).value).toBe('/srv/samples/')
+})
+
+it('explains a missing VPS API instead of showing Not Found',async()=>{
+ vi.stubGlobal('fetch',vi.fn(async(input:string)=>{
+  const url=String(input)
+  if(url==='/api/manage/vps/defaults')return {ok:false,status:404,statusText:'Not Found',json:async()=>({detail:'Not Found'})}
+  return {ok:true,json:async()=>url==='/api/manage/batches'||url==='/api/manage/versions'?[]:{}}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ await waitFor(()=>expect(view.getByText(/VPS用APIが見つかりません.*バックエンドを再起動してください/)).toBeTruthy())
+})
+
+it('lists completed VPS versions and imports the selected version into sources',async()=>{
+ const posts:{url:string;body:any}[]=[]
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='POST'){
+   const body=JSON.parse(String(init.body));posts.push({url,body})
+   return {ok:true,json:async()=>url==='/api/manage/vps/versions'?{versions:['samples20261017-01','samples20261017-02']}:{job_id:'copy-job'}}
+  }
+  const value=url==='/api/manage/vps/defaults'?{host:'vps',remote_root:'/srv',source_root:'/data/sources'}:
+   url==='/api/manage/batches'||url==='/api/manage/versions'?[]:
+   url==='/api/manage/jobs/copy-job'?{kind:'vps_import',status:'complete',progress:5,total:5,result:'VPS版をsourcesへ登録しました: /data/sources/samples20261017-02'}:{}
+  return {ok:true,json:async()=>value}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(view.getByText('VPSから取得'))
+ await waitFor(()=>expect((view.getByLabelText('SSH接続先') as HTMLInputElement).value).toBe('vps'))
+ fireEvent.click(view.getByText('完成済みの版を一覧表示'))
+ await waitFor(()=>expect(view.getByLabelText('取得する版を選択')).toBeTruthy())
+ fireEvent.click(view.getByLabelText('取得する版を選択'))
+ fireEvent.click(view.getByRole('button',{name:'samples20261017-02'}))
+ expect(view.getByText('編集用バッチ: /data/sources/samples20261017-02')).toBeTruthy()
+ fireEvent.click(view.getByText('選択した版を取得・sourcesへ登録'))
+ await waitFor(()=>expect(posts[1]).toEqual({url:'/api/manage/vps/copy',body:{host:'vps',remote_root:'/srv',version:'samples20261017-02'}}))
+ await waitFor(()=>expect(view.getByText('VPS版をsourcesへ登録しました: /data/sources/samples20261017-02')).toBeTruthy())
+})
 
 it('creates a version from a read-only split reference with the selected parent',async()=>{
  const posts:{url:string;body:any}[]=[]

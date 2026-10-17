@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from . import core, importer, registry, versions, export, folder_picker
+from . import core, importer, registry, versions, export, folder_picker, vps
 from PIL import Image
 
 app=FastAPI(title='Mahjong Annotation Editor')
@@ -21,6 +21,11 @@ class ImportBody(BaseModel):
     origin:str=''
 class FolderPickerBody(BaseModel):
     current_path:str=''
+class VpsConnectionBody(BaseModel):
+    host:str
+    remote_root:str
+class VpsCopyBody(VpsConnectionBody):
+    version:str
 class VersionBody(BaseModel):
     parent:str|None=None
     batch_ids:list[int]|None=None
@@ -38,7 +43,7 @@ class ReferenceVersionBody(BaseModel):
 pool=ThreadPoolExecutor(max_workers=2)
 def job(kind,fn,*args,**kwargs):
     key=uuid4().hex
-    total={'import':3,'import_version':3,'version':6,'reference':6,'unpartitioned':3,'confirm_batch':2,'archive':2,'upload':3}.get(kind,1)
+    total={'import':3,'import_version':3,'version':6,'reference':6,'unpartitioned':3,'confirm_batch':2,'archive':2,'upload':3,'vps_import':5}.get(kind,1)
     with registry.connect() as db: db.execute('INSERT INTO jobs(id,kind,status,progress,total,updated_at) VALUES(?,?,?,?,?,?)',(key,kind,'queued',0,total,registry.now()))
     def run():
         def progress(n):
@@ -93,6 +98,19 @@ def batches(): return registry.list_batches()
 def batch_confirm(batch_id:int): return job('confirm_batch',registry.confirm_batch,batch_id)
 @app.get('/api/manage/analysis')
 def analysis(): return registry.analysis()
+@app.get('/api/manage/vps/defaults')
+def vps_defaults(): return vps.defaults()
+@app.post('/api/manage/vps/versions')
+def vps_versions(body:VpsConnectionBody):
+    try: return {'versions':vps.list_versions(body.host,body.remote_root)}
+    except (OSError,ValueError) as e: raise HTTPException(422,str(e))
+@app.post('/api/manage/vps/copy')
+def vps_copy(body:VpsCopyBody):
+    try:
+        vps.validate_connection(body.host,body.remote_root)
+        if not vps.VERSION_PATTERN.fullmatch(body.version): raise ValueError('不正な版名です')
+    except ValueError as e: raise HTTPException(422,str(e))
+    return job('vps_import',vps.import_version,body.host,body.remote_root,body.version)
 @app.post('/api/manage/import/select-folder')
 def select_import_folder(body:FolderPickerBody):
     try: return {'path':folder_picker.choose_folder(body.current_path)}
