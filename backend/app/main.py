@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from . import core, importer, registry, versions, export, folder_picker, vps
+from . import core, editor_read, importer, registry, versions, export, folder_picker, vps
 from PIL import Image
 
 app=FastAPI(title='Mahjong Annotation Editor')
@@ -79,13 +79,25 @@ def images(dataset_id:str): return core.images(dataset_id)
 def stats(dataset_id:str):
     items=core.images(dataset_id)
     return {'total':len(items),'reviewed':sum(x['status']=='reviewed' for x in items),'held':sum(x['status']=='held' for x in items),'unreviewed':sum(x['status'] in ('unreviewed','provisional','unannotated') for x in items),'modified':sum(x['modified'] for x in items)}
-@app.get('/api/images/{image_id}')
-def image(image_id:str):
-    d,p,f=core.image(image_id)
+@app.get('/api/editor/overview')
+def editor_overview(): return editor_read.overview()
+@app.get('/api/editor/datasets/{dataset_id}/images')
+def editor_images(dataset_id:str): return editor_read.list_images(dataset_id)
+def image_detail(d,p,f,image_id):
     try:
         with Image.open(f) as im: width,height=im.size; im.verify()
     except Exception as e: raise HTTPException(422,f'画像読み込みエラー: {e}')
     return {'id':image_id,'name':f.name,'width':width,'height':height,'editable':d['editable'],'classes':core.classes_for(d,p) if d['editable'] or d.get('format')=='coco' else [],'status':core.status_for(f),'annotations':core.label_info(d,p,f)}
+@app.get('/api/editor/images/{image_id}')
+def editor_image(image_id:str):
+    return image_detail(*editor_read.get_image(image_id),image_id)
+@app.get('/api/editor/images/{image_id}/file')
+def editor_image_file(image_id:str):
+    _,_,f=editor_read.get_image(image_id)
+    return FileResponse(f)
+@app.get('/api/images/{image_id}')
+def image(image_id:str):
+    return image_detail(*core.image(image_id),image_id)
 @app.get('/api/images/{image_id}/file')
 def image_file(image_id:str):
     _,_,f=core.image(image_id)

@@ -12,14 +12,28 @@ def next_id(db):
     ids=[int(r[0][1:]) for r in db.execute("SELECT id FROM versions WHERE id GLOB 'v[0-9]*'") if re.fullmatch(r'v\d+',r[0])]
     return f'v{max(ids,default=0)+1:03d}'
 def versions():
-    with reg.connect() as db: return [dict(r) for r in db.execute('SELECT id,parent_id,kind,description,created_at,test_id,status,upload_status,manifest_json FROM versions ORDER BY created_at DESC')]
+    with reg.connect() as db:
+        result=[dict(r) for r in db.execute('SELECT id,parent_id,kind,description,created_at,test_id,status,upload_status,manifest_json FROM versions ORDER BY created_at DESC')]
+        for version in result:
+            version['included_batch_ids']=[r[0] for r in db.execute('''
+                SELECT b.id FROM batches b
+                WHERE EXISTS (SELECT 1 FROM batch_images bi WHERE bi.batch_id=b.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM batch_images bi
+                    WHERE bi.batch_id=b.id AND NOT EXISTS (
+                      SELECT 1 FROM version_images vi
+                      WHERE vi.version_id=? AND vi.image_id=bi.image_id
+                    )
+                  )
+            ''',(version['id'],))]
+        return result
 def rows_from_db(batch_ids=None,image_ids=None,require_review=True):
     with reg.connect() as db:
         query='''SELECT i.id image_id,i.sha256,bi.path,i.filename,i.width,i.height,i.source_type,a.content_json,a.content_sha256,a.status,b.id batch_id,b.provenance FROM images i JOIN annotations a ON a.image_id=i.id JOIN batches b ON b.id=a.batch_id JOIN batch_images bi ON bi.batch_id=b.id AND bi.image_id=i.id'''
         rows=[dict(r) for r in db.execute(query)]
     selected=[]; seen={}
     for r in rows:
-        if batch_ids and r['batch_id'] not in batch_ids: continue
+        if batch_ids is not None and r['batch_id'] not in batch_ids: continue
         if image_ids and r['image_id'] not in image_ids: continue
         if require_review and r['status']!='reviewed': continue
         key=r['image_id']

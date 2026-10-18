@@ -100,6 +100,9 @@ def classes_for(d,p):
 
 def images(dataset_id):
     d,p = dataset(dataset_id)
+    return images_for(d,p)
+
+def images_for(d,p):
     folder = p/'images' if not d.get('images_direct') and (p/'images').is_dir() else p
     files=image_paths(folder)
     from . import registry

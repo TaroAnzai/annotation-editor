@@ -12,6 +12,7 @@ beforeEach(()=>{
  Object.defineProperty(SVGSVGElement.prototype,'getScreenCTM',{configurable:true,value:()=>({inverse:()=>({})})})
  Object.defineProperty(SVGSVGElement.prototype,'setPointerCapture',{configurable:true,value:()=>{}})
  Object.defineProperty(SVGSVGElement.prototype,'releasePointerCapture',{configurable:true,value:()=>{}})
+ vi.spyOn(HTMLCanvasElement.prototype,'getContext').mockReturnValue({font:'',measureText:()=>({width:48})} as unknown as CanvasRenderingContext2D)
  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
   const url=String(input),body=init?.body?JSON.parse(String(init.body)):null
   if(init?.method==='PUT'){
@@ -19,10 +20,9 @@ beforeEach(()=>{
    const data=url.endsWith('/annotations')?{boxes:body.boxes,version:'v2'}:{status:body.status,modified:false}
    return {ok:true,json:async()=>data}
   }
-  const data=url==='/api/folders'?{id:'root',name:'data',path:'.',children:[{id:'folder',name:'sample',path:'sample',children:[]}]}:
-   url==='/api/datasets'?[{id:'ds',name:'sample',path:'sample',images:2,editable:true}]:
-   url.endsWith('/stats')?{reviewed:0,images:2}:url.endsWith('/images')?rows:
-   url.startsWith('/api/images/')?{id:url.split('/')[3],name:url.includes('img1')?'1.jpg':'2.jpg',width:100,height:100,editable:true,classes:['1m','2m'],status:{status:'unreviewed',modified:false},annotations:{boxes:[{...box}],version:'v1',error:null}}:null
+  const data=url==='/api/editor/overview'?{folders:{id:'root',name:'data',path:'.',children:[{id:'folder',name:'sample',path:'sample',children:[]}]},datasets:[{id:'ds',name:'sample',path:'sample',images:2,editable:true}],counts:{ds:{reviewed:0,images:2}}}:
+   url.endsWith('/images')?rows:
+   url.startsWith('/api/editor/images/')?{id:url.split('/')[4],name:url.includes('img1')?'1.jpg':'2.jpg',width:100,height:100,editable:true,classes:['1m','2m'],status:{status:'unreviewed',modified:false},annotations:{boxes:[{...box}],version:'v1',error:null}}:null
   return {ok:true,json:async()=>data}
  }))
 })
@@ -36,8 +36,8 @@ describe('image editing workflow',()=>{
   const listGate=new Promise<void>(resolve=>{releaseList=resolve})
   const detailGate=new Promise<void>(resolve=>{releaseDetail=resolve})
   vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
-   if(String(input)==='/api/datasets/ds/images')await listGate
-   if(String(input)==='/api/images/img1')await detailGate
+   if(String(input)==='/api/editor/datasets/ds/images')await listGate
+   if(String(input)==='/api/editor/images/img1')await detailGate
    return original(input,init)
   }))
   const view=render(<App/>)
@@ -53,7 +53,7 @@ describe('image editing workflow',()=>{
  })
  it('clears loading progress when the image list fails',async()=>{
   const original=globalThis.fetch
-  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>String(input)==='/api/datasets/ds/images'?{ok:false,status:500,statusText:'Server Error',json:async()=>({detail:'一覧を読み込めません'})}:original(input,init)))
+  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>String(input)==='/api/editor/datasets/ds/images'?{ok:false,status:500,statusText:'Server Error',json:async()=>({detail:'一覧を読み込めません'})}:original(input,init)))
   const view=render(<App/>)
   await waitFor(()=>expect(view.getByText('sample')).toBeTruthy())
   fireEvent.click(view.getByText('sample'))
@@ -63,8 +63,7 @@ describe('image editing workflow',()=>{
  it('shows an image when a parent folder contains several datasets',async()=>{
   const original=globalThis.fetch
   vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
-   if(String(input)==='/api/folders')return {ok:true,json:async()=>({id:'root',name:'data',path:'.',children:[{id:'parent',name:'sources',path:'sources',children:[]}]})}
-   if(String(input)==='/api/datasets')return {ok:true,json:async()=>[{id:'ds',name:'first',path:'sources/first',images:2,editable:true},{id:'ds2',name:'second',path:'sources/second',images:2,editable:true}]}
+   if(String(input)==='/api/editor/overview')return {ok:true,json:async()=>({folders:{id:'root',name:'data',path:'.',children:[{id:'parent',name:'sources',path:'sources',children:[]}]},datasets:[{id:'ds',name:'first',path:'sources/first',images:2,editable:true},{id:'ds2',name:'second',path:'sources/second',images:2,editable:true}],counts:{ds:{reviewed:0,images:2},ds2:{reviewed:0,images:2}}})}
    return original(input,init)
   }))
   const view=render(<App/>)
@@ -83,8 +82,9 @@ describe('image editing workflow',()=>{
   const assertLabelSize=()=>{
    const visibleWidth=Number(svg.getAttribute('viewBox')!.split(' ')[2])
    const text=svg.querySelector('g text')!,background=svg.querySelectorAll('g rect')[1]
-   expect(Number(text.getAttribute('font-size'))*50/visibleWidth).toBeCloseTo(20)
-   expect(Number(background.getAttribute('height'))*50/visibleWidth).toBeCloseTo(30)
+   expect(Number(text.getAttribute('font-size'))*50/visibleWidth).toBeCloseTo(16)
+   expect(Number(background.getAttribute('width'))*50/visibleWidth).toBeCloseTo(58)
+   expect(Number(background.getAttribute('height'))*50/visibleWidth).toBeCloseTo(23)
   }
   assertLabelSize()
   fireEvent.wheel(svg,{deltaY:-100,clientX:30,clientY:30})
@@ -155,6 +155,40 @@ describe('image editing workflow',()=>{
   expect(list.scrollTop).toBe(58)
   fireEvent.pointerDown(rect,{clientX:25,clientY:35,pointerId:1});fireEvent.pointerMove(svg,{clientX:35,clientY:45,pointerId:1});fireEvent.pointerUp(svg,{clientX:35,clientY:45,pointerId:1});
   expect(Number(svg.querySelector('g rect')?.getAttribute('x'))).toBeCloseTo(30);
+ })
+ it('resizes a box from the wider invisible handle target',async()=>{
+  const view=await opened(),svg=view.container.querySelector<SVGSVGElement>('.stage svg')!
+  fireEvent.click(view.container.querySelector('.annotation-row')!)
+  const handle=svg.querySelector<SVGGElement>('[data-handle="se"]')!
+  const hit=handle.querySelectorAll('rect')[0],dot=handle.querySelectorAll('rect')[1]
+  expect(Number(hit.getAttribute('width'))).toBeGreaterThan(Number(dot.getAttribute('width')))
+  fireEvent.pointerDown(hit,{button:0,clientX:40,clientY:60,pointerId:1})
+  fireEvent.pointerMove(svg,{clientX:45,clientY:65,pointerId:1})
+  fireEvent.pointerUp(svg,{clientX:45,clientY:65,pointerId:1})
+  expect(Number(svg.querySelector('g rect')?.getAttribute('width'))).toBeCloseTo(25)
+  expect(Number(svg.querySelector('g rect')?.getAttribute('height'))).toBeCloseTo(35)
+ })
+ it('keeps resize handles above a later overlapping box',async()=>{
+  const original=globalThis.fetch
+  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+   const response=await original(input,init)
+   if(String(input)!=='/api/editor/images/img1')return response
+   const detail=await response.json()
+   detail.annotations.boxes.push({class_id:1,x:.35,y:.55,w:.3,h:.3})
+   return {ok:true,json:async()=>detail}
+  }))
+  const view=await opened(),svg=view.container.querySelector<SVGSVGElement>('.stage svg')!
+  fireEvent.click(view.container.querySelectorAll('.annotation-row')[0])
+  const handles=svg.querySelector<SVGGElement>('[data-resize-handles]')!
+  expect(svg.lastElementChild).toBe(handles)
+  expect(handles.getAttribute('data-box')).toBe('0')
+  const hit=handles.querySelector('[data-handle="se"] rect')!
+  fireEvent.pointerDown(hit,{button:0,clientX:40,clientY:60,pointerId:1})
+  fireEvent.pointerMove(svg,{clientX:45,clientY:65,pointerId:1})
+  fireEvent.pointerUp(svg,{clientX:45,clientY:65,pointerId:1})
+  const boxRects=svg.querySelectorAll(':scope > g[data-box] > rect:first-child')
+  expect(Number(boxRects[0].getAttribute('width'))).toBeCloseTo(25)
+  expect(Number(boxRects[1].getAttribute('width'))).toBeCloseTo(30)
  })
  it('selects a box, changes only its class, and supports undo/redo',async()=>{
   const view=await opened();fireEvent.click(view.container.querySelector('.annotation-row')!);const rect=view.container.querySelector('svg g rect')!;const coords=[rect.getAttribute('x'),rect.getAttribute('y'),rect.getAttribute('width'),rect.getAttribute('height')]

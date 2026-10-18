@@ -79,6 +79,19 @@ def test_paths_and_api(sample,tmp_path):
     with pytest.raises(HTTPException):main.image('not-an-id')
     assert main.health()['ok']
 
+def test_editor_opening_uses_catalog_and_preserves_legacy_status(sample,monkeypatch):
+    p,_=sample
+    core.set_status(p/'images'/'2.jpg','reviewed')
+    overview=main.editor_overview()
+    ds=overview['datasets'][0]
+    assert overview['counts'][ds['id']]=={'reviewed':1,'images':2}
+    assert overview['counts'][ds['id']]['reviewed']==main.stats(ds['id'])['reviewed']
+    monkeypatch.setattr(core,'datasets',lambda: pytest.fail('unexpected full catalog scan'))
+    rows=main.editor_images(ds['id'])
+    assert [r['name'] for r in rows]==['2.jpg','10.jpg']
+    assert main.editor_image(rows[0]['id'])['status']['status']=='reviewed'
+    assert main.editor_image_file(rows[0]['id']).path==p/'images'/'2.jpg'
+
 def test_version_job_result_is_a_short_summary():
     result={'id':'v003','manifest':{'splits':{'train':{'image_count':2226},'val':{'image_count':270},'test':{'image_count':230}},'leaf_sources':[{'source_name':'very long manifest'}]}}
     assert main.job_result_text('version',result)=='v003 を作成しました（train 2226 / val 270 / test 230 枚）'

@@ -126,6 +126,7 @@ def test_imports_vps_version_as_editable_provisional_source(tmp_path, monkeypatc
     source = core.DATA / "sources" / version
     assert list(core.DATA.rglob(f"{sample}.jpg")) == [source / "images" / f"{sample}.jpg"]
     assert (source / "labels" / f"{sample}.txt").read_text() == "0 0.5 0.5 0.4 0.4\n"
+    assert (source / "labels.org" / f"{sample}.txt").read_text() == "0 0.5 0.5 0.4 0.4\n"
     assert not (source / "annotations").exists()
     assert (source / "meta" / "source" / f"{sample}.json").exists()
     assert [row['name'] for row in json.loads((source/'meta'/'classes.json').read_text())][-3:]==['red5m','red5p','red5s']
@@ -139,5 +140,23 @@ def test_imports_vps_version_as_editable_provisional_source(tmp_path, monkeypatc
     (source / "annotations" / "yolo" / f"{sample}.txt").write_text("0 0.5 0.5 0.4 0.4\n")
     assert "登録済み" in vps.import_version("vps", "/srv", version)
     assert (source / "labels" / f"{sample}.txt").read_text().startswith("1 ")
+    assert (source / "labels.org" / f"{sample}.txt").read_text().startswith("0 ")
     assert not (source / "annotations").exists()
     assert vps.verify(archive, imported=True) is None
+
+
+def test_preserve_original_annotations_keeps_empty_labels_and_rejects_changes(tmp_path):
+    source = tmp_path / "source"
+    sample = "00000000-0000-4000-8000-000000000001"
+    (source / "meta").mkdir(parents=True)
+    (source / "annotations" / "yolo").mkdir(parents=True)
+    (source / "meta" / "manifest.jsonl").write_text(json.dumps({"sampleId": sample}) + "\n")
+    (source / "annotations" / "yolo" / f"{sample}.txt").write_text("")
+
+    vps.preserve_original_annotations(source)
+    saved = source / "labels.org" / f"{sample}.txt"
+    assert saved.is_file() and saved.read_text() == ""
+    (source / "annotations" / "yolo" / f"{sample}.txt").write_text("0 0.5 0.5 0.4 0.4\n")
+    with pytest.raises(ValueError, match="一致しません"):
+        vps.preserve_original_annotations(source)
+    assert saved.read_text() == ""

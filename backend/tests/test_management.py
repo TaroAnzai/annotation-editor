@@ -146,6 +146,10 @@ def test_version_fixed_test_archive_and_training_validation(root):
     t1=(core.DATA/'versions'/first['id']/'test'/'labels'/'instances.json').read_bytes()
     register(yolo(root,'extra',3),'extra','real');review('extra')
     second=versions.create(parent=first['id'],batch_ids=[3],keep_test=True,val_ratio=.3,seed=7)
+    listed={item['id']:item for item in versions.versions()}
+    assert set(listed[first['id']]['included_batch_ids'])=={1,2}
+    assert set(listed[second['id']]['included_batch_ids'])=={1,2,3}
+    assert len(versions.rows_from_db([]))==0
     assert second['test_id']==first['test_id']
     assert (core.DATA/'versions'/second['id']/'test'/'labels'/'instances.json').read_bytes()==t1
     rebuilt=versions.create(parent=second['id'],keep_test=False,test_real=2,test_synthetic=1,val_ratio=.2,seed=8)

@@ -202,6 +202,31 @@ def remove_original_annotations(source: Path):
         (source / "annotations").rmdir()
 
 
+def preserve_original_annotations(source: Path):
+    """Keep the phone's original predictions separate from editable labels."""
+    entries = [json.loads(line) for line in
+               (source / "meta" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()]
+    originals = source / "labels.org"
+    available = [(entry["sampleId"], source / "annotations" / "yolo" / f'{entry["sampleId"]}.txt')
+                 for entry in entries]
+    if originals.is_symlink():
+        raise ValueError("元予測の保存先がシンボリックリンクです")
+    if not originals.exists() and not any(path.exists() for _, path in available):
+        return  # A previously imported version has no original predictions left to recover.
+    originals.mkdir(exist_ok=True)
+    for sample, original in available:
+        saved = originals / f"{sample}.txt"
+        if saved.is_symlink():
+            raise ValueError(f"元予測がシンボリックリンクです: {sample}")
+        if not original.exists():
+            continue  # Already registered versions may have removed the VPS copy.
+        if saved.exists():
+            if not saved.is_file() or sha256(saved) != sha256(original):
+                raise ValueError(f"保存済みの元予測がVPS版と一致しません: {sample}")
+        else:
+            shutil.copy2(original, saved)
+
+
 def import_version(host: str, remote_root: str, version: str, progress=None):
     """Download one verified VPS version directly into an editable source batch."""
     validate_connection(host, remote_root)
@@ -216,6 +241,7 @@ def import_version(host: str, remote_root: str, version: str, progress=None):
         if registered["path"] != registry.rel(source):
             raise ValueError(f"同名の別バッチが既にあります: {version}")
         verify(source, imported=True)
+        preserve_original_annotations(source)
         remove_original_annotations(source)
         if progress: progress(5)
         return f"登録済み: {source}"
@@ -245,6 +271,7 @@ def import_version(host: str, remote_root: str, version: str, progress=None):
             json.dumps({"version": version, "host": host}, ensure_ascii=False) + "\n",
             encoding="utf-8")
     normalize_yolo_yaml(source/'data.yaml')
+    preserve_original_annotations(source)
     if progress: progress(3)
     preview = importer.preview(str(source), "register", "real")
     if preview["errors"] or preview["conflicts"]:

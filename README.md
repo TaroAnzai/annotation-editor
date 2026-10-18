@@ -47,7 +47,7 @@ preparedは `images/`、`annotations/instances.json`、`manifest.json` を持つ
 
 ## VPSから学習データを取得
 
-「VPSから取得」でSSH接続先（`user@host` または `~/.ssh/config` のホスト名）とVPSの保存ルートを入力します。VPSの `<保存ルート>/data-versions/` から `READY` がある `samplesYYYYMMDD-NN` 形式の版を一覧表示します。版を選ぶと、`rsync` で `sources/<版名>/` に直接転送し、`meta/checksums.sha256` の全ファイルを検証してバッチ登録します。画像はローカルに1ファイルだけ保存します。元の `annotations/yolo/` から編集用の `labels/` と `data.yaml` を同じバッチ内に作り、登録成功後に重複する元のアノテーションファイルを削除します。転送失敗時の `.partial` フォルダーは再実行時に利用します。スマホ由来のアノテーションは「仮アノテーション」から始まり、編集画面で確認・修正できます。登録済みの版を再実行しても編集済みラベルを上書きしません。
+「VPSから取得」でSSH接続先（`user@host` または `~/.ssh/config` のホスト名）とVPSの保存ルートを入力します。VPSの `<保存ルート>/data-versions/` から `READY` がある `samplesYYYYMMDD-NN` 形式の版を一覧表示します。版を選ぶと、`rsync` で `sources/<版名>/` に直接転送し、`meta/checksums.sha256` の全ファイルを検証してバッチ登録します。画像はローカルに1ファイルだけ保存します。元の `annotations/yolo/` から編集用の `labels/` と、スマホの元予測を保管する `labels.org/` を同じバッチ内に作り、`data.yaml` を生成します。`labels.org/` はエディターで変更せず、再取得時も上書きしません。登録成功後に重複する元の `annotations/yolo/` を削除します。転送失敗時の `.partial` フォルダーは再実行時に利用します。スマホ由来のアノテーションは「仮アノテーション」から始まり、編集画面で確認・修正できます。登録済みの版を再実行しても編集済みラベルを上書きしません。以前に取り込んで元の `annotations/yolo/` を削除済みの版には、元予測を後から復元できません。
 
 PCに `ssh` と `rsync` をインストールし、アプリを起動するユーザーのSSH鍵とVPSのホスト鍵を事前に設定してください。GUIに認証情報は保存しません。`TRAINING_DATA_SSH_HOST` と `TRAINING_DATA_HOST_DIR` で接続先と保存ルートの初期値を指定できます。保存先は `../data/sources/<版名>/` です。確認済みの画像だけを学習用の `versions/vNNN` に組み込めます。作成済みの学習用バージョンは独立したスナップショットとして画像を保存します。
 

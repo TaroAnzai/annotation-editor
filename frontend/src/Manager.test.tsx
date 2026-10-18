@@ -108,6 +108,34 @@ it('creates a version from a read-only split reference with the selected parent'
  expect(view.container.querySelector('.manager-content')?.hasAttribute('inert')).toBe(true)
 })
 
+it('disables batches already in the parent and submits no additional batches when none remain selected',async()=>{
+ const posts:{url:string;body:any}[]=[]
+ const batches=[1,2].map(id=>({id,name:`batch-${id}`,format:'coco',origin:'',image_count:2,annotation_count:2,bbox_count:2,source_types:{real:2},reviewed_count:2,unreviewed_count:0,held_count:0,duplicate_count:0}))
+ const versions=[1,2].map(id=>({id:`v00${id}`,parent_id:null,kind:'completed',description:'',created_at:'',test_id:null,status:'complete',upload_status:'not_uploaded',manifest_json:'{}',included_batch_ids:[id]}))
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='POST'){posts.push({url,body:JSON.parse(String(init.body))});return {ok:true,json:async()=>({job_id:'queued'})}}
+  return {ok:true,json:async()=>url==='/api/manage/batches'?batches:url==='/api/manage/versions'?versions:url==='/api/manage/analysis'?{}:{ready:false,message:'未設定'}}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(view.getByText('バージョン管理'))
+ const first=await view.findByRole('checkbox',{name:/batch-1/}) as HTMLInputElement
+ const second=view.getByRole('checkbox',{name:/batch-2/}) as HTMLInputElement
+ fireEvent.click(second)
+ fireEvent.click(view.getByLabelText('親バージョンを選択'))
+ fireEvent.click(view.getByRole('button',{name:'v001 · 完成'}))
+ expect(first.disabled).toBe(true)
+ expect(second.checked).toBe(true)
+ fireEvent.click(view.getByLabelText('親バージョンを選択'))
+ fireEvent.click(view.getByRole('button',{name:'v002 · 完成'}))
+ expect(first.disabled).toBe(false)
+ expect(second.disabled).toBe(true)
+ expect(second.checked).toBe(false)
+ fireEvent.click(view.getByText('完成バージョン作成'))
+ await waitFor(()=>expect(posts).toHaveLength(1))
+ expect(posts[0].body).toMatchObject({parent:'v002',batch_ids:[]})
+})
+
 it('uses in-page dropdowns for import settings and sends the selected values to preview',async()=>{
  const posts:{url:string;body:any}[]=[]
  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
