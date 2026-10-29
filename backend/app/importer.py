@@ -1,6 +1,7 @@
 """Read-only import inspection and explicit transactional registration."""
 from __future__ import annotations
 import json, shutil, tempfile, os, uuid
+import re
 from pathlib import Path
 from PIL import Image
 import yaml
@@ -233,6 +234,15 @@ def register(value:str,mode:str,source_type:str|None,name:str,expected:str,origi
             existing=db.execute('SELECT id FROM batches WHERE name=? OR path=?',(name,reg.rel(destination))).fetchone()
             if existing: return {'batch_id':existing[0],'already_registered':True}
             provenance=dict(scan['manifest'] or {})
+            augmentation_file=destination/'augmentation.json'
+            if augmentation_file.is_file():
+                provenance=json.loads(augmentation_file.read_text(encoding='utf-8'))
+                records=provenance.get('images',[])
+                names=[item.get('generated_image') for item in records] if isinstance(records,list) and all(isinstance(item,dict) for item in records) else []
+                if (provenance.get('dataset_type')!='augmentation' or not isinstance(records,list) or len(records)!=len(scan['rows'])
+                    or len(names)!=len(set(names)) or set(names)!={Path(r['rel']).name for r in scan['rows']}
+                    or any(not isinstance(item.get('source_sha256'),str) or not re.fullmatch('[0-9a-f]{64}',item['source_sha256']) for item in records)):
+                    raise ImportErrorDetail('Augmentationメタデータが不正です')
             if scan['conflicts']: provenance['excluded_conflicts']=scan['conflicts']
             cur=db.execute('INSERT INTO batches(name,path,format,origin,provenance,created_at) VALUES(?,?,?,?,?,?)',(name,reg.rel(destination),scan['kind'],origin,json.dumps(provenance,ensure_ascii=False),reg.now()))
             batch_id=cur.lastrowid

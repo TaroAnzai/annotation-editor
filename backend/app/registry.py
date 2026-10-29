@@ -1,6 +1,6 @@
 """SQLite registry; all database locations are under the configured data root."""
 from __future__ import annotations
-import json, sqlite3, hashlib, threading
+import json, sqlite3, hashlib, threading, shutil, uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,8 +88,70 @@ def list_batches():
             b['annotation_count']=sum(bool(json.loads(r[0])) for r in annotations)
             b['bbox_count']=sum(len(json.loads(r[0])) for r in annotations)
             b['source_types']={r['source_type']:r['n'] for r in db.execute('SELECT i.source_type,COUNT(*) n FROM batch_images bi JOIN images i ON i.id=bi.image_id WHERE bi.batch_id=? GROUP BY i.source_type',(b['id'],))}
+            b['delete_blockers']=batch_delete_blockers(db,b)
+            b['deletable']=not b['delete_blockers']
             result.append(b)
         return result
+
+def batch_delete_blockers(db,batch):
+    batch_id=batch['id']; reasons=[]
+    folder=core.DATA/batch['path']
+    if folder.parent!=core.DATA/'sources' or folder.name!=batch['name'] or not folder.is_dir() or folder.is_symlink():
+        reasons.append('sources内の登録済みフォルダーを確認できません')
+    elif any(item.is_symlink() for item in folder.rglob('*')):
+        reasons.append('フォルダー内にシンボリックリンクがあります')
+    if db.execute('''SELECT 1 FROM version_images vi JOIN batch_images bi ON bi.image_id=vi.image_id
+                     WHERE bi.batch_id=? LIMIT 1''',(batch_id,)).fetchone():
+        reasons.append('バージョンに含まれる画像があります')
+    if db.execute('''SELECT 1 FROM batch_images mine JOIN batch_images other
+                     ON other.image_id=mine.image_id AND other.batch_id!=mine.batch_id
+                     WHERE mine.batch_id=? LIMIT 1''',(batch_id,)).fetchone():
+        reasons.append('別のバッチと共有する画像があります')
+    if db.execute('''SELECT 1 FROM conflicts c JOIN annotations a ON a.id=c.other_annotation_id
+                     WHERE a.batch_id=? AND c.batch_id!=? LIMIT 1''',(batch_id,batch_id)).fetchone():
+        reasons.append('別のバッチの競合情報から参照されています')
+    if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone():
+        reasons.append('処理中のジョブがあります')
+    if db.execute('''SELECT 1 FROM batch_images bi LEFT JOIN annotations a
+                     ON a.batch_id=bi.batch_id AND a.image_id=bi.image_id
+                     WHERE bi.batch_id=? AND a.id IS NULL LIMIT 1''',(batch_id,)).fetchone():
+        reasons.append('登録済み画像のアノテーションが見つかりません')
+    if folder.is_dir() and not folder.is_symlink():
+        for row in db.execute('SELECT path FROM batch_images WHERE batch_id=?',(batch_id,)):
+            image=core.DATA/row['path']
+            if not image.is_relative_to(folder) or not image.is_file() or image.is_symlink():
+                reasons.append('登録済み画像を確認できません')
+                break
+    return reasons
+
+def delete_batch(batch_id:int):
+    """Remove an unreferenced source batch and its registry rows together."""
+    staged=None; folder=None
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        batch=db.execute('SELECT id,name,path FROM batches WHERE id=?',(batch_id,)).fetchone()
+        if not batch: raise ValueError('バッチが見つかりません')
+        reasons=batch_delete_blockers(db,batch)
+        if reasons: raise ValueError('削除できません: '+' / '.join(reasons))
+        folder=core.DATA/batch['path']
+        image_ids=[r[0] for r in db.execute('SELECT image_id FROM batch_images WHERE batch_id=?',(batch_id,))]
+        staged=folder.parent/f'.delete-{uuid.uuid4().hex}'
+        folder.rename(staged)
+        try:
+            db.execute('DELETE FROM conflicts WHERE batch_id=?',(batch_id,))
+            db.execute('DELETE FROM status_history WHERE annotation_id IN (SELECT id FROM annotations WHERE batch_id=?)',(batch_id,))
+            db.execute('DELETE FROM annotation_history WHERE annotation_id IN (SELECT id FROM annotations WHERE batch_id=?)',(batch_id,))
+            db.execute('DELETE FROM annotations WHERE batch_id=?',(batch_id,))
+            db.execute('DELETE FROM batch_images WHERE batch_id=?',(batch_id,))
+            for image_id in image_ids: db.execute('DELETE FROM images WHERE id=?',(image_id,))
+            db.execute('DELETE FROM batches WHERE id=?',(batch_id,))
+            db.commit()
+        except Exception:
+            db.rollback()
+            staged.rename(folder)
+            raise
+    shutil.rmtree(staged)
+    return {'deleted':True,'batch_id':batch_id}
 
 def sync_batch_annotations(batch_id:int,progress=None):
     """Reconcile one registered batch with its current annotation files."""

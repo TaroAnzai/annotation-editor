@@ -1,6 +1,6 @@
 """Immutable canonical COCO dataset versions and reproducible splits."""
 from __future__ import annotations
-import json, shutil, tempfile, random, hashlib, re
+import json, shutil, tempfile, random, hashlib, re, uuid
 from pathlib import Path
 from . import core, registry as reg, importer
 from .schema import CATEGORIES, validate_coco, category_mapping, normalize_mapping_config
@@ -11,10 +11,61 @@ def write_json(p,v): p.parent.mkdir(parents=True,exist_ok=True); p.write_text(js
 def next_id(db):
     ids=[int(r[0][1:]) for r in db.execute("SELECT id FROM versions WHERE id GLOB 'v[0-9]*'") if re.fullmatch(r'v\d+',r[0])]
     return f'v{max(ids,default=0)+1:03d}'
+def resolve_id(db,requested=None):
+    version_id=requested if requested is not None else next_id(db)
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}',version_id):
+        raise ValueError('バージョンIDは半角英数字で始まる英数字・_・- の64文字以内で指定してください')
+    if db.execute('SELECT 1 FROM versions WHERE id=?',(version_id,)).fetchone() or (core.DATA/'versions'/version_id).exists():
+        raise ValueError(f'バージョンID {version_id} は既に使用されています')
+    return version_id
+def delete_blockers(db,version):
+    version_id=version['id']; folder=core.DATA/version['path']; reasons=[]
+    if folder.parent!=core.DATA/'versions' or folder.name!=version_id or not folder.is_dir() or folder.is_symlink():
+        reasons.append('保存済みフォルダーを確認できません')
+    if db.execute('SELECT 1 FROM versions WHERE parent_id=? LIMIT 1',(version_id,)).fetchone():
+        reasons.append('子バージョンがあります')
+    if db.execute('''SELECT 1 FROM version_images mine JOIN version_images other
+                     ON other.image_id=mine.image_id AND other.version_id!=mine.version_id
+                     JOIN images i ON i.id=mine.image_id
+                     WHERE mine.version_id=? AND (i.path=? OR instr(i.path, ?)=1) LIMIT 1''',
+                  (version_id,version['path'],version['path']+'/%')).fetchone():
+        reasons.append('別のバージョンが保存フォルダー内の画像を参照しています')
+    if db.execute('''SELECT 1 FROM version_images vi JOIN batch_images bi ON bi.image_id=vi.image_id
+                     WHERE vi.version_id=? AND EXISTS (
+                         SELECT 1 FROM images i WHERE i.id=vi.image_id AND (i.path=? OR instr(i.path, ?)=1)
+                     ) LIMIT 1''',(version_id,version['path'],version['path']+'/%')).fetchone():
+        reasons.append('取り込みバッチが参照する画像があります')
+    if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone():
+        reasons.append('処理中のジョブがあります')
+    return reasons
+def delete_version(version_id):
+    with reg.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        version=db.execute('SELECT id,path FROM versions WHERE id=?',(version_id,)).fetchone()
+        if not version: raise ValueError('バージョンが見つかりません')
+        reasons=delete_blockers(db,version)
+        if reasons: raise ValueError('削除できません: '+' / '.join(reasons))
+        folder=core.DATA/version['path']; staged=folder.parent/f'.delete-{uuid.uuid4().hex}'
+        image_ids=[r[0] for r in db.execute('SELECT image_id FROM version_images WHERE version_id=?',(version_id,))]
+        folder.rename(staged)
+        try:
+            db.execute('DELETE FROM version_images WHERE version_id=?',(version_id,))
+            for image_id in image_ids:
+                db.execute('''DELETE FROM images WHERE id=? AND NOT EXISTS
+                             (SELECT 1 FROM batch_images WHERE image_id=?) AND NOT EXISTS
+                             (SELECT 1 FROM version_images WHERE image_id=?)''',(image_id,image_id,image_id))
+            db.execute('DELETE FROM versions WHERE id=?',(version_id,))
+            db.commit()
+        except Exception:
+            db.rollback(); staged.rename(folder); raise
+    shutil.rmtree(staged)
+    return {'deleted':True,'version_id':version_id}
 def versions():
     with reg.connect() as db:
-        result=[dict(r) for r in db.execute('SELECT id,parent_id,kind,description,created_at,test_id,status,upload_status,manifest_json FROM versions ORDER BY created_at DESC')]
+        result=[dict(r) for r in db.execute('SELECT id,parent_id,kind,path,description,created_at,test_id,status,upload_status,manifest_json FROM versions ORDER BY created_at DESC')]
         for version in result:
+            version['delete_blockers']=delete_blockers(db,version)
+            version['deletable']=not version['delete_blockers']
             version['included_batch_ids']=[r[0] for r in db.execute('''
                 SELECT b.id FROM batches b
                 WHERE EXISTS (SELECT 1 FROM batch_images bi WHERE bi.batch_id=b.id)
@@ -54,14 +105,14 @@ def rows_from_db(batch_ids=None,image_ids=None,require_review=True):
                         raise ValueError(f"DBとファイルの内容が違います: {row['filename']}")
     return selected
 
-def create_unpartitioned(batch_ids=None,description='',progress=None):
+def create_unpartitioned(batch_ids=None,description='',progress=None,version_id=None):
     """Freeze registered source annotations before TEST and split decisions."""
     selected=rows_from_db(batch_ids,require_review=False)
     if not selected: raise ValueError('対象画像がありません')
     if any(not json.loads(r['content_json']) for r in selected): raise ValueError('BBoxのない画像があります')
     if progress: progress(1)
     with reg.connect() as db:
-        version_id=next_id(db)
+        version_id=resolve_id(db,version_id)
         batch_info=[dict(r) for r in db.execute('SELECT id,name,origin FROM batches WHERE id IN ('+','.join('?' for _ in {r['batch_id'] for r in selected})+')',tuple({r['batch_id'] for r in selected}))]
     target=core.DATA/'versions'/version_id;target.parent.mkdir(parents=True,exist_ok=True)
     staged=Path(tempfile.mkdtemp(prefix='.unpartitioned-',dir=target.parent))
@@ -74,6 +125,7 @@ def create_unpartitioned(batch_ids=None,description='',progress=None):
         image_inventory=sorted((p.name,reg.sha(p)) for p in (staged/'images').iterdir())
         manifest={'manifest_version':2,'dataset_type':'editor_unpartitioned','dataset_id':jd(sorted((r['sha256'],r['content_sha256']) for r in selected)),'created_at':reg.now(),'image_count':len(coco['images']),'annotation_count':len(coco['annotations']),'annotation_sha256':jd(coco),'image_inventory_sha256':jd(image_inventory),'source_type_summary':{t:sum(r['source_type']==t for r in selected) for t in ('real','synthetic')},'source_batches':batch_info,'review_status_summary':{s:sum(r['status']==s for r in selected) for s in ('reviewed','unreviewed','provisional','held','unannotated')},'description':description,'split_status':'unpartitioned'}
         write_json(staged/'manifest.json',manifest)
+        if target.exists(): raise ValueError(f'バージョンID {version_id} は既に使用されています')
         staged.replace(target)
         try:
             with reg.connect() as db:
@@ -86,6 +138,34 @@ def create_unpartitioned(batch_ids=None,description='',progress=None):
     finally: shutil.rmtree(staged,ignore_errors=True)
 def parent_rows(db,parent):
     return [{**dict(r),'sha256':r['image_sha256'],'content_sha256':r['annotation_sha256']} for r in db.execute('SELECT vi.*,i.path,i.filename,i.width,i.height FROM version_images vi JOIN images i ON i.id=vi.image_id WHERE vi.version_id=?',(parent,))]
+def origin_groups(rows):
+    """Resolve augmented images to the original image hash recorded at creation."""
+    by_batch={}
+    wanted={r['image_id'] for r in rows}
+    with reg.connect() as db:
+        for record in db.execute('SELECT b.provenance,bi.image_id,bi.path FROM batches b JOIN batch_images bi ON bi.batch_id=b.id'):
+            if record['image_id'] not in wanted: continue
+            try: provenance=json.loads(record['provenance'])
+            except (ValueError,TypeError): continue
+            if provenance.get('dataset_type')!='augmentation': continue
+            if 'images' not in provenance: raise ValueError('Augmentationの出自情報がありません')
+            mapping={item['generated_image']:item['source_sha256'] for item in provenance['images']}
+            origin=mapping.get(Path(record['path']).name)
+            if not origin: raise ValueError('Augmentationの元画像を特定できません')
+            previous=by_batch.get(record['image_id'])
+            if previous and previous!=origin: raise ValueError('Augmentationの出自情報が競合しています')
+            by_batch[record['image_id']]=origin
+    return {r['image_id']:by_batch.get(r['image_id'],r['sha256']) for r in rows}
+
+def assert_group_splits(rows):
+    groups=origin_groups([r for r in rows if 'image_id' in r])
+    assigned={}
+    for r in rows:
+        key=groups[r['image_id']]
+        if key in assigned and assigned[key]!=r['split']:
+            raise ValueError('元画像と派生画像がtrain/val/testに分離されています')
+        assigned[key]=r['split']
+
 def split_rows(rows,parent_rows_,fixed,real_count,synthetic_count,val_ratio,seed):
     if not 0<=val_ratio<1: raise ValueError('Validation比率は0以上1未満です')
     combined={r['image_id']:r for r in parent_rows_}
@@ -95,9 +175,49 @@ def split_rows(rows,parent_rows_,fixed,real_count,synthetic_count,val_ratio,seed
         combined[key]=r
     all_rows=list(combined.values())
     if not all_rows: raise ValueError('確認済み画像がありません')
+    groups=origin_groups(all_rows)
+    parent_splits={}
+    for row in parent_rows_:
+        key=groups[row['image_id']]
+        if key in parent_splits and parent_splits[key]!=row['split']:
+            raise ValueError('親バージョン内で元画像と派生画像の分割が異なります')
+        parent_splits[key]=row['split']
     if fixed:
-        selected={r['image_id'] for r in parent_rows_ if r['split']=='test'}
+        selected={groups[r['image_id']] for r in parent_rows_ if r['split']=='test'}
         if not selected: raise ValueError('親バージョンのTESTがありません')
+        parent_ids={r['image_id'] for r in parent_rows_}
+        if any(type(count)!=int or count<0 for count in (real_count,synthetic_count)):
+            raise ValueError('TEST枚数は0以上の整数です')
+        if real_count or synthetic_count:
+            added=[r for r in all_rows if r['image_id'] not in parent_ids]
+            forced={typ:sum(r['source_type']==typ and groups[r['image_id']] in selected for r in added)
+                    for typ in ('real','synthetic')}
+            candidates={}
+            for r in added:
+                group=groups[r['image_id']]
+                if group in parent_splits: continue
+                counts=candidates.setdefault(group,{'real':0,'synthetic':0})
+                counts[r['source_type']]+=1
+            for typ,count in (('real',real_count),('synthetic',synthetic_count)):
+                available=forced[typ]+sum(item[typ] for item in candidates.values())
+                if count>available:
+                    raise ValueError(f'追加{typ} TEST不足: required={count} available={available}')
+            if forced['real']>real_count or forced['synthetic']>synthetic_count:
+                raise ValueError('親のTESTと同じ元画像グループの追加画像が指定TEST枚数を超えます')
+            target=(real_count,synthetic_count)
+            states={(forced['real'],forced['synthetic']):()}
+            candidate_groups=sorted(candidates)
+            random.Random(str(seed)).shuffle(candidate_groups)
+            for group in candidate_groups:
+                amount=candidates[group]
+                for (real,synthetic),chosen_groups in list(states.items()):
+                    next_counts=(real+amount['real'],synthetic+amount['synthetic'])
+                    if next_counts[0]<=real_count and next_counts[1]<=synthetic_count:
+                        states.setdefault(next_counts,chosen_groups+(group,))
+                if target in states: break
+            if target not in states:
+                raise ValueError('元画像と派生画像を同じ分割に保つと、指定された追加TEST枚数を満たせません')
+            selected.update(states[target])
     else:
         selected=set()
         for typ,count in (('real',real_count),('synthetic',synthetic_count)):
@@ -105,16 +225,18 @@ def split_rows(rows,parent_rows_,fixed,real_count,synthetic_count,val_ratio,seed
             available=sorted((r for r in all_rows if r['source_type']==typ),key=lambda r:r['sha256'])
             if count>len(available): raise ValueError(f'{typ} TEST不足: required={count} available={len(available)}')
             random.Random(f'{seed}:{typ}').shuffle(available)
-            selected.update(r['image_id'] for r in available[:count])
+            selected.update(groups[r['image_id']] for r in available[:count])
     result=[]
     for r in all_rows:
         item=dict(r)
-        if item['image_id'] in selected: item['split']='test'
-        elif fixed and item['image_id'] in {x['image_id'] for x in parent_rows_}: item['split']=item.get('split','train') if item.get('split')!='test' else 'train'
+        group=groups[item['image_id']]
+        if group in selected: item['split']='test'
+        elif fixed and group in parent_splits: item['split']=parent_splits[group]
         else:
-            bucket=int(hashlib.sha256(f"{seed}:{item['sha256']}".encode()).hexdigest(),16)/(1<<256)
+            bucket=int(hashlib.sha256(f"{seed}:{group}".encode()).hexdigest(),16)/(1<<256)
             item['split']='val' if bucket<val_ratio else 'train'
         result.append(item)
+    assert_group_splits(result)
     if not any(r['split']=='train' for r in result) or (val_ratio>0 and not any(r['split']=='val' for r in result)): raise ValueError('train/valに十分な画像がありません')
     return result
 
@@ -196,9 +318,9 @@ def normalize_version_payload(root:Path):
             write_json(path,manifest)
     normalize_mapping_config(root/'dataset.yaml')
 
-def create(parent=None,batch_ids=None,image_ids=None,test_real=0,test_synthetic=0,val_ratio=.1,seed=42,keep_test=True,description='',progress=None):
+def create(parent=None,batch_ids=None,image_ids=None,test_real=0,test_synthetic=0,val_ratio=.1,seed=42,keep_test=True,description='',progress=None,version_id=None):
     with reg.connect() as db:
-        version_id=next_id(db)
+        version_id=resolve_id(db,version_id)
         parent_info=db.execute('SELECT * FROM versions WHERE id=?',(parent,)).fetchone() if parent else None
         if parent and not parent_info: raise ValueError('親バージョンがありません')
         parent_items=parent_rows(db,parent) if parent else []
@@ -219,8 +341,9 @@ def create(parent=None,batch_ids=None,image_ids=None,test_real=0,test_synthetic=
     target=core.DATA/'versions'/version_id;target.parent.mkdir(parents=True,exist_ok=True)
     staged=Path(tempfile.mkdtemp(prefix='.version-',dir=target.parent))
     try:
+        preserve_test=fixed and test_real==0 and test_synthetic==0
         for index,split in enumerate(SPLITS,2):
-            if split=='test' and fixed:
+            if split=='test' and preserve_test:
                 shutil.copytree(reg.path(parent_info['path'])/'test',staged/'test')
             else: render_split(staged,split,[r for r in chosen if r['split']==split])
             if progress: progress(index)
@@ -232,14 +355,15 @@ def create(parent=None,batch_ids=None,image_ids=None,test_real=0,test_synthetic=
         if parent_manifest.get('leaf_sources'): leaves.extend(parent_manifest['leaf_sources'])
         leaves=list({json.dumps(x,sort_keys=True):x for x in leaves}.values())
         if not leaves: leaves=[{'source_id':source_id,'source_digest':source_id}]
-        split_facts={s:(dict(parent_manifest['splits']['test'],preserved=True) if s=='test' and fixed else facts(staged,s,source_id,leaves)) for s in SPLITS}
+        split_facts={s:(dict(parent_manifest['splits']['test'],preserved=True) if s=='test' and preserve_test else facts(staged,s,source_id,leaves)) for s in SPLITS}
         identity={'splits':{s:{k:split_facts[s][k] for k in ('source_dataset_id','image_inventory_sha256','annotation_sha256')} for s in SPLITS}}
-        manifest={'manifest_version':2,'dataset_id':jd(identity),'source_dataset_id':source_id,'leaf_sources':leaves,'seed':seed,'ratios':{'train':1-val_ratio,'val':val_ratio,'test':0},'requested_test_count':None,'requested_test_source_types':None if fixed else {'synthetic':test_synthetic,'real':test_real},'requested_val_source_types':None,'rebuild_test':not fixed,'created_at':reg.now(),'splits':split_facts,'parent_version':parent,'description':description,'fixed_test':fixed}
+        manifest={'manifest_version':2,'dataset_id':jd(identity),'source_dataset_id':source_id,'leaf_sources':leaves,'seed':seed,'ratios':{'train':1-val_ratio,'val':val_ratio,'test':0},'requested_test_count':None,'requested_test_source_types':None if preserve_test else {'synthetic':test_synthetic,'real':test_real},'requested_val_source_types':None,'rebuild_test':not fixed,'created_at':reg.now(),'splits':split_facts,'parent_version':parent,'description':description,'fixed_test':fixed}
         write_json(staged/'dataset_manifest.json',manifest)
         validate(staged)
         if progress: progress(5)
         test_id=jd({'annotation':split_facts['test']['annotation_sha256'],'images':split_facts['test']['image_inventory_sha256']})
-        if fixed and test_id!=parent_info['test_id']: raise ValueError('固定TESTが変化しました')
+        if preserve_test and test_id!=parent_info['test_id']: raise ValueError('固定TESTが変化しました')
+        if target.exists(): raise ValueError(f'バージョンID {version_id} は既に使用されています')
         staged.replace(target)
         try:
             with reg.connect() as db:
@@ -250,7 +374,7 @@ def create(parent=None,batch_ids=None,image_ids=None,test_real=0,test_synthetic=
         return {'id':version_id,'manifest':manifest,'test_id':test_id}
     finally: shutil.rmtree(staged,ignore_errors=True)
 
-def create_from_reference(parent:str, reference_path:str, description:str='', progress=None):
+def create_from_reference(parent:str, reference_path:str, description:str='', progress=None, version_id=None):
     """Rebuild an exact split from registered sources, using an external dataset read-only."""
     reference=Path(reference_path).expanduser()
     if reference.is_symlink() or not reference.is_dir(): raise ValueError('参照datasetフォルダーがありません')
@@ -263,7 +387,7 @@ def create_from_reference(parent:str, reference_path:str, description:str='', pr
         if not parent_info or parent_info['kind']!='unpartitioned':
             raise ValueError('未分割の親バージョンを選択してください')
         parent_items=parent_rows(db,parent)
-        version_id=next_id(db)
+        version_id=resolve_id(db,version_id)
     current={row['image_id']:row for row in rows_from_db(image_ids={row['image_id'] for row in parent_items})}
     for row in parent_items:
         registered=current.get(row['image_id'])
@@ -297,6 +421,7 @@ def create_from_reference(parent:str, reference_path:str, description:str='', pr
             assigned.append((split,name,row))
     if len(assigned)!=len(parent_items) or len({row['image_id'] for _,_,row in assigned})!=len(parent_items):
         raise ValueError('参照datasetと親バージョンの画像集合が一致しません')
+    assert_group_splits([{**row,'sha256':row['image_sha256'],'split':split} for split,_,row in assigned])
     if progress: progress(2)
     target=core.DATA/'versions'/version_id
     target.parent.mkdir(parents=True,exist_ok=True)
@@ -322,6 +447,7 @@ def create_from_reference(parent:str, reference_path:str, description:str='', pr
             raise ValueError('正規化後のdataset_idが一致しません')
         test=manifest['splits']['test']
         test_id=jd({'annotation':test['annotation_sha256'],'images':test['image_inventory_sha256']})
+        if target.exists(): raise ValueError(f'バージョンID {version_id} は既に使用されています')
         staged.replace(target)
         try:
             with reg.connect() as db:

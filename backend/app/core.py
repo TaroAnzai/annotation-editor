@@ -39,7 +39,7 @@ def datasets():
     out = []
     DATA.mkdir(parents=True, exist_ok=True)
     for root, dirs, files in os.walk(DATA, followlinks=False):
-        dirs[:] = [d for d in dirs if not (Path(root)/d).is_symlink() and 'preview' not in d.lower()]
+        dirs[:] = [d for d in dirs if not d.startswith('.') and not (Path(root)/d).is_symlink() and 'preview' not in d.lower()]
         p = Path(root)
         if p == DATA or 'preview' in p.name.lower(): continue
         imgs = p/'images'

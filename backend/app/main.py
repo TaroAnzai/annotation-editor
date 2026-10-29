@@ -1,9 +1,10 @@
+import sqlite3, base64
 from fastapi import FastAPI, HTTPException
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from . import core, editor_read, importer, registry, versions, export, folder_picker, vps
+from . import core, editor_read, importer, registry, versions, export, folder_picker, vps, augmentation
 from PIL import Image
 
 app=FastAPI(title='Mahjong Annotation Editor')
@@ -27,6 +28,7 @@ class VpsConnectionBody(BaseModel):
 class VpsCopyBody(VpsConnectionBody):
     version:str
 class VersionBody(BaseModel):
+    version_id:str|None=None
     parent:str|None=None
     batch_ids:list[int]|None=None
     image_ids:list[int]|None=None
@@ -40,8 +42,19 @@ class ReferenceVersionBody(BaseModel):
     parent:str
     reference_path:str
     description:str=''
+    version_id:str|None=None
+class AugmentationBody(BaseModel):
+    dataset_ids:list[str]
+    name:str=''
+    variants:int=1
+    seed:int=42
+    transforms:dict|None=None
+    index:int=0
+    source_type:str='real'
 pool=ThreadPoolExecutor(max_workers=2)
 def job_result_text(kind,result):
+    if kind=='augmentation' and isinstance(result,dict):
+        return f"{result['name']} を作成しました（画像 {result['image_count']} 枚、警告 {result['warning_count']} 件）"
     if kind in ('version','unpartitioned','reference') and isinstance(result,dict) and result.get('id'):
         manifest=result.get('manifest') or {}
         splits=manifest.get('splits') or result.get('counts') or {}
@@ -56,12 +69,16 @@ def job(kind,fn,*args,**kwargs):
     total={'import':3,'import_version':3,'version':6,'reference':6,'unpartitioned':3,'confirm_batch':2,'sync_batch':2,'archive':2,'upload':3,'vps_import':5}.get(kind,1)
     with registry.connect() as db: db.execute('INSERT INTO jobs(id,kind,status,progress,total,updated_at) VALUES(?,?,?,?,?,?)',(key,kind,'queued',0,total,registry.now()))
     def run():
-        def progress(n):
-            with registry.connect() as db: db.execute('UPDATE jobs SET progress=?,updated_at=? WHERE id=?',(n,registry.now(),key))
+        def progress(n,new_total=None):
+            with registry.connect() as db:
+                if new_total is None: db.execute('UPDATE jobs SET progress=?,updated_at=? WHERE id=?',(n,registry.now(),key))
+                else: db.execute('UPDATE jobs SET progress=?,total=?,updated_at=? WHERE id=?',(n,new_total,registry.now(),key))
         with registry.connect() as db: db.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?",(registry.now(),key))
         try:
             result=fn(*args,**kwargs,progress=progress)
-            with registry.connect() as db: db.execute("UPDATE jobs SET status='complete',progress=?,result=?,updated_at=? WHERE id=?",(total,job_result_text(kind,result),registry.now(),key))
+            with registry.connect() as db:
+                final_total=db.execute('SELECT total FROM jobs WHERE id=?',(key,)).fetchone()[0]
+                db.execute("UPDATE jobs SET status='complete',progress=?,result=?,updated_at=? WHERE id=?",(final_total,job_result_text(kind,result),registry.now(),key))
         except Exception as e:
             with registry.connect() as db: db.execute("UPDATE jobs SET status='failed',error=?,updated_at=? WHERE id=?",(str(e),registry.now(),key))
     pool.submit(run)
@@ -116,10 +133,32 @@ def status(image_id:str,body:StatusBody):
 
 @app.get('/api/manage/batches')
 def batches(): return registry.list_batches()
+@app.get('/api/manage/augmentation/sources')
+def augmentation_sources():
+    return [d for d in core.datasets() if d['path'].startswith('sources/') and len(d['path'].split('/'))==2 and d.get('format')!='images']
+@app.get('/api/manage/augmentation/defaults')
+def augmentation_defaults(): return augmentation.DEFAULTS
+@app.post('/api/manage/augmentation/preview')
+def augmentation_preview(body:AugmentationBody):
+    try:
+        result=augmentation.render_preview(body.dataset_ids,body.seed,body.transforms,body.index,source_type=body.source_type)
+        for key in ('original','augmented'): result[key]='data:image/png;base64,'+base64.b64encode(result[key]).decode('ascii')
+        return result
+    except ValueError as e: raise HTTPException(422,str(e))
+@app.post('/api/manage/augmentation')
+def augmentation_create(body:AugmentationBody):
+    try: augmentation.options(body.dataset_ids,body.name,body.variants,body.seed,body.transforms)
+    except ValueError as e: raise HTTPException(422,str(e))
+    return job('augmentation',augmentation.create,body.dataset_ids,body.name,body.variants,body.seed,body.transforms,source_type=body.source_type)
 @app.post('/api/manage/batches/{batch_id}/confirm')
 def batch_confirm(batch_id:int): return job('confirm_batch',registry.confirm_batch,batch_id)
 @app.post('/api/manage/batches/{batch_id}/sync')
 def batch_sync(batch_id:int): return job('sync_batch',registry.sync_batch_annotations,batch_id)
+@app.delete('/api/manage/batches/{batch_id}')
+def batch_delete(batch_id:int):
+    try: return registry.delete_batch(batch_id)
+    except ValueError as e: raise HTTPException(409,str(e))
+    except (OSError,sqlite3.Error) as e: raise HTTPException(500,f'削除処理に失敗しました: {e}')
 @app.get('/api/manage/analysis')
 def analysis(): return registry.analysis()
 @app.get('/api/manage/vps/defaults')
@@ -154,10 +193,15 @@ def version_list(): return versions.versions()
 @app.post('/api/manage/versions')
 def version_create(body:VersionBody): return job('version',versions.create,**body.model_dump())
 @app.post('/api/manage/versions/unpartitioned')
-def version_unpartitioned(body:VersionBody): return job('unpartitioned',versions.create_unpartitioned,body.batch_ids,body.description)
+def version_unpartitioned(body:VersionBody): return job('unpartitioned',versions.create_unpartitioned,body.batch_ids,body.description,version_id=body.version_id)
 @app.post('/api/manage/versions/from-reference')
 def version_from_reference(body:ReferenceVersionBody):
-    return job('reference',versions.create_from_reference,body.parent,body.reference_path,body.description)
+    return job('reference',versions.create_from_reference,body.parent,body.reference_path,body.description,version_id=body.version_id)
+@app.delete('/api/manage/versions/{version_id}')
+def version_delete(version_id:str):
+    try: return versions.delete_version(version_id)
+    except ValueError as e: raise HTTPException(409,str(e))
+    except (OSError,sqlite3.Error) as e: raise HTTPException(500,f'削除処理に失敗しました: {e}')
 @app.get('/api/manage/versions/{version_id}/validate')
 def version_validate(version_id:str):
     try:

@@ -5,6 +5,69 @@ import Manager from './Manager'
 
 afterEach(()=>{cleanup();sessionStorage.removeItem('mahjong-annotation-editor-active-job');sessionStorage.removeItem('mahjong-annotation-editor-blocking-job');localStorage.removeItem('mahjong-annotation-editor-vps-connection');vi.unstubAllGlobals()})
 
+it('disables protected batch deletion and reports a failed delete without removing the row',async()=>{
+ const batches=[
+  {id:1,name:'protected',deletable:false,delete_blockers:['バージョンに含まれる画像があります']},
+  {id:2,name:'available',deletable:true,delete_blockers:[]},
+ ].map(b=>({...b,format:'yolo',origin:'',image_count:1,annotation_count:1,bbox_count:1,source_types:{real:1},reviewed_count:0,unreviewed_count:1,held_count:0,duplicate_count:0}))
+ const calls:string[]=[]
+ vi.stubGlobal('confirm',vi.fn(()=>true))
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='DELETE'){calls.push(url);return {ok:false,status:409,statusText:'Conflict',json:async()=>({detail:'削除できません: バージョンに含まれる画像があります'})}}
+  return {ok:true,json:async()=>url==='/api/manage/batches'?batches:url==='/api/manage/versions'?[]:{}}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ const buttons=await view.findAllByRole('button',{name:'削除'}) as HTMLButtonElement[]
+ expect(buttons[0].disabled).toBe(true)
+ expect(view.getByText('バージョンに含まれる画像があります')).toBeTruthy()
+ fireEvent.click(buttons[1])
+ await waitFor(()=>expect(calls).toEqual(['/api/manage/batches/2']))
+ await waitFor(()=>expect(view.getByText(/削除できません: バージョンに含まれる画像があります/)).toBeTruthy())
+ expect(view.getByText('available')).toBeTruthy()
+})
+
+it('uses the next numeric ID by default and accepts a custom version ID and description',async()=>{
+ const posts:any[]=[]
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='POST'){posts.push(JSON.parse(String(init.body)));return {ok:true,json:async()=>({job_id:'create-job'})}}
+  return {ok:true,json:async()=>url==='/api/manage/versions'?[{id:'v007',parent_id:null,kind:'completed',description:'',created_at:'',test_id:null,status:'complete',upload_status:'not_uploaded',manifest_json:'{}',included_batch_ids:[]}]:url==='/api/manage/batches'?[]:{}}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(view.getByText('バージョン管理'))
+ const id=await view.findByLabelText('バージョンID') as HTMLInputElement
+ expect(id.value).toBe('v008')
+ fireEvent.change(id,{target:{value:'experiment_2026'}})
+ fireEvent.change(view.getByLabelText('説明（任意）'),{target:{value:'評価用'}})
+ fireEvent.click(view.getByText('未分割バージョン作成（TESTは後で設定）'))
+ await waitFor(()=>expect(posts[0]).toMatchObject({version_id:'experiment_2026',description:'評価用'}))
+})
+
+it('asks for confirmation in a modal before deleting a saved version',async()=>{
+ let present=true
+ const calls:string[]=[]
+ const saved={id:'v003',parent_id:null,kind:'unpartitioned',description:'検証用',created_at:'',test_id:null,status:'unpartitioned',upload_status:'not_uploaded',manifest_json:'{}',included_batch_ids:[],deletable:true,delete_blockers:[]}
+ vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
+  const url=String(input)
+  if(init?.method==='DELETE'){calls.push(url);present=false;return {ok:true,json:async()=>({deleted:true})}}
+  return {ok:true,json:async()=>url==='/api/manage/versions'?(present?[saved]:[]):url==='/api/manage/batches'?[]:{}}
+ }))
+ const view=render(<Manager onEditor={()=>{}}/>)
+ fireEvent.click(view.getByText('バージョン管理'))
+ const button=await view.findByRole('button',{name:'削除'})
+ fireEvent.click(button)
+ expect(calls).toEqual([])
+ const dialog=view.getByRole('dialog',{name:'バージョン削除の確認'})
+ expect(dialog.textContent).toContain('v003')
+ fireEvent.click(view.getByRole('button',{name:'キャンセル'}))
+ expect(view.queryByRole('dialog',{name:'バージョン削除の確認'})).toBeNull()
+ fireEvent.click(button)
+ fireEvent.click(view.getByRole('button',{name:'削除する'}))
+ await waitFor(()=>expect(calls).toEqual(['/api/manage/versions/v003']))
+ await waitFor(()=>expect(view.queryByText('v003')).toBeNull())
+})
+
 it('remembers a successful VPS connection and prefers it over backend defaults',async()=>{
  let reject=false
  vi.stubGlobal('fetch',vi.fn(async(input:string,init?:RequestInit)=>{
@@ -103,7 +166,7 @@ it('creates a version from a read-only split reference with the selected parent'
  fireEvent.change(view.getByLabelText('参照datasetフォルダー'),{target:{value:'/example/dataset'}})
  fireEvent.click(view.getByText('同じtrain / val / testで完成バージョン作成'))
  await waitFor(()=>expect(posts).toHaveLength(1))
- expect(posts[0]).toEqual({url:'/api/manage/versions/from-reference',body:{parent:'v001',reference_path:'/example/dataset',description:''}})
+ expect(posts[0]).toEqual({url:'/api/manage/versions/from-reference',body:{parent:'v001',reference_path:'/example/dataset',description:'',version_id:'v002'}})
  expect(view.getByRole('dialog',{name:'バージョン作成の進捗'})).toBeTruthy()
  expect(view.container.querySelector('.manager-content')?.hasAttribute('inert')).toBe(true)
 })

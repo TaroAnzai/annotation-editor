@@ -36,6 +36,71 @@ def review(name):
         paths=[r[0] for r in db.execute('SELECT bi.path FROM batch_images bi JOIN batches b ON b.id=bi.batch_id WHERE b.name=?',(name,))]
     for path in paths: core.set_status(core.DATA/path,'reviewed')
 
+def test_delete_unreferenced_batch_removes_files_and_registry(root):
+    batch=register(yolo(root,'delete_input',2),'delete_me','real')
+    folder=core.DATA/'sources'/'delete_me'
+    listed=registry.list_batches()[0]
+    assert listed['deletable'] and listed['delete_blockers']==[]
+    assert main.batch_delete(batch['batch_id'])=={'deleted':True,'batch_id':batch['batch_id']}
+    assert not folder.exists() and registry.list_batches()==[]
+    with registry.connect() as db:
+        for table in ('batches','images','batch_images','annotations','annotation_history','status_history','conflicts'):
+            assert db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]==0
+
+def test_delete_refuses_versioned_and_shared_batches_without_changes(root):
+    source=yolo(root,'first_input',2)
+    first=register(source,'first','real')
+    register(source,'second','real')
+    assert not registry.list_batches()[0]['deletable']
+    with pytest.raises(Exception,match='共有する画像'):
+        main.batch_delete(first['batch_id'])
+    assert (core.DATA/'sources'/'first').exists()
+    versioned=register(yolo(root,'version_input',2),'versioned','real')
+    with registry.connect() as db:
+        image_id=db.execute('SELECT image_id FROM batch_images WHERE batch_id=?',(versioned['batch_id'],)).fetchone()[0]
+        db.execute("INSERT INTO versions(id,kind,path,created_at,manifest_json,status) VALUES('v001','completed','versions/v001',?,'{}','complete')",(registry.now(),))
+        db.execute("INSERT INTO version_images(version_id,image_id,split,image_sha256,annotation_sha256,content_json,source_type) VALUES('v001',?,'train','','','[]','real')",(image_id,))
+    assert any('バージョンに含まれる画像' in reason for reason in next(b for b in registry.list_batches() if b['id']==versioned['batch_id'])['delete_blockers'])
+    with pytest.raises(Exception,match='バージョンに含まれる画像'):
+        main.batch_delete(versioned['batch_id'])
+    assert (core.DATA/'sources'/'versioned').exists()
+    with registry.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM batches WHERE id=?',(versioned['batch_id'],)).fetchone()[0]==1
+
+def test_custom_version_id_description_and_delete(root):
+    register(yolo(root,'custom_version',2),'source','real')
+    made=versions.create_unpartitioned(batch_ids=[1],description='試験用',version_id='v007')
+    assert made['id']=='v007' and made['manifest']['description']=='試験用'
+    with registry.connect() as db:
+        assert versions.next_id(db)=='v008'
+    assert versions.versions()[0]['description']=='試験用'
+    with pytest.raises(ValueError,match='既に使用'):
+        versions.create_unpartitioned(batch_ids=[1],version_id='v007')
+    with pytest.raises(ValueError,match='バージョンID'):
+        versions.create_unpartitioned(batch_ids=[1],version_id='../bad')
+    assert versions.delete_version('v007')['deleted']
+    assert not (core.DATA/'versions'/'v007').exists()
+    with registry.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM versions').fetchone()[0]==0
+        assert db.execute('SELECT COUNT(*) FROM version_images').fetchone()[0]==0
+        assert db.execute('SELECT COUNT(*) FROM images').fetchone()[0]==2
+
+def test_version_delete_rejects_parent_until_child_is_removed(root):
+    register(yolo(root,'protected_version',2),'source','real')
+    versions.create_unpartitioned(batch_ids=[1],version_id='v010')
+    versions.create_unpartitioned(batch_ids=[1],version_id='v011')
+    with registry.connect() as db:
+        db.execute("UPDATE versions SET parent_id='v010' WHERE id='v011'")
+    listed={v['id']:v for v in versions.versions()}
+    assert not listed['v010']['deletable']
+    assert '子バージョンがあります' in listed['v010']['delete_blockers']
+    with pytest.raises(ValueError,match='削除できません'):
+        versions.delete_version('v010')
+    assert (core.DATA/'versions'/'v010').exists()
+    assert listed['v011']['deletable']
+    assert versions.delete_version('v011')['deleted']
+    assert versions.delete_version('v010')['deleted']
+
 def test_yolo_import_conflict_and_rollback(root):
     p=yolo(root,'input',3);register(p,'first','real');register(p,'second','real')
     with registry.connect() as db: assert db.execute('SELECT COUNT(*) FROM images').fetchone()[0]==3
@@ -170,6 +235,47 @@ def test_version_fixed_test_archive_and_training_validation(root):
             subprocess.run([str(training_python),'-c',code,str(extracted)],check=True)
     assert versions.validate(extracted)['valid']
 
+def test_fixed_test_adds_requested_images_only_from_new_batches(root):
+    register(yolo(root,'parent_real',6),'parent_real','real')
+    register(coco(root,'parent_synthetic',5,'synthetic'),'parent_synthetic','synthetic')
+    review('parent_real');review('parent_synthetic')
+    parent=versions.create(test_real=1,test_synthetic=1,val_ratio=.3,seed=7)
+    register(yolo(root,'added_real',5),'added_real','real')
+    register(coco(root,'added_synthetic',5,'synthetic'),'added_synthetic','synthetic')
+    review('added_real');review('added_synthetic')
+    child=versions.create(parent=parent['id'],batch_ids=[3,4],keep_test=True,
+                          test_real=2,test_synthetic=1,val_ratio=.3,seed=7)
+    with registry.connect() as db:
+        def splits(version_id):
+            return {r['image_id']:r['split'] for r in db.execute(
+                'SELECT image_id,split FROM version_images WHERE version_id=?',(version_id,))}
+        before=splits(parent['id']);after=splits(child['id'])
+        added_types={r['image_id']:r['source_type'] for r in db.execute(
+            'SELECT image_id,source_type FROM version_images WHERE version_id=?',(child['id'],))
+            if r['image_id'] not in before}
+    assert all(after[image_id]==split for image_id,split in before.items())
+    assert {typ:sum(after[image_id]=='test' for image_id,t in added_types.items() if t==typ)
+            for typ in ('real','synthetic')}=={'real':2,'synthetic':1}
+    assert child['test_id']!=parent['test_id']
+    assert child['manifest']['splits']['test']['image_count']==5
+    assert versions.validate(core.DATA/'versions'/child['id'])['valid']
+    with pytest.raises(ValueError,match='追加real TEST不足'):
+        versions.create(parent=parent['id'],batch_ids=[3],keep_test=True,
+                        test_real=6,val_ratio=.3,seed=7)
+
+def test_fixed_test_respects_origin_group_when_adding(monkeypatch):
+    parent=[{'image_id':1,'sha256':'1','source_type':'real','split':'test'},
+            {'image_id':2,'sha256':'2','source_type':'real','split':'train'}]
+    added=[{'image_id':3,'sha256':'3','source_type':'real'},
+           {'image_id':4,'sha256':'4','source_type':'real'},
+           {'image_id':5,'sha256':'5','source_type':'real'}]
+    group_ids={1:'test',2:'train',3:'pair',4:'pair',5:'single'}
+    monkeypatch.setattr(versions,'origin_groups',lambda rows:{r['image_id']:group_ids[r['image_id']] for r in rows})
+    result=versions.split_rows(added,parent,True,2,0,0,42)
+    assert {r['image_id'] for r in result if r['split']=='test'}=={1,3,4}
+    with pytest.raises(ValueError,match='指定された追加TEST枚数を満たせません'):
+        versions.split_rows(added[:2],parent,True,1,0,0,42)
+
 def test_prepared_and_merged_import(root):
     prepared=coco(root,'prepared',2,'real');(prepared/'manifest.json').write_text(json.dumps({'dataset_type':'prepared','image_count':2,'annotation_count':2,'source_type_summary':{'real':2,'synthetic':0},'leaf_sources':[{'source_id':'x'}]}))
     register(prepared,'prepared','real')
@@ -186,6 +292,7 @@ def test_drive_upload_order_and_failure(root,monkeypatch):
         db.execute("INSERT INTO versions(id,kind,path,created_at,manifest_json,status) VALUES('v001','completed','versions/v001',?,'{}','complete')",(registry.now(),))
     meta={'file':archive.name,'sha256':registry.sha(archive),'snapshot_id':'sample'}
     monkeypatch.setattr(export,'archive',lambda version_id,publish_latest=True:meta)
+    monkeypatch.setattr(export,'recover_older_archive',lambda root:None)
     monkeypatch.setattr(export,'setup',lambda:{'ready':True})
     monkeypatch.setattr(export.shutil,'which',lambda x:'/usr/bin/rclone')
     calls=[]
@@ -203,6 +310,82 @@ def test_drive_upload_order_and_failure(root,monkeypatch):
     assert export.upload('v001',True)['uploaded']
     assert 'latest.json' in calls[-1][-1]
     assert json.loads((exports/'latest.json').read_text())==meta
+
+def test_drive_upload_reuses_verified_zip_after_failure(root,monkeypatch):
+    from types import SimpleNamespace
+    register(yolo(root,'upload_source',4),'upload_source','real')
+    review('upload_source')
+    version_id=versions.create(test_real=1,val_ratio=.4,seed=3)['id']
+    monkeypatch.setattr(export,'setup',lambda:{'ready':True})
+    monkeypatch.setattr(export.shutil,'which',lambda x:'/usr/bin/rclone')
+    original_archive=export.archive
+    created=[]
+    def counted_archive(*args,**kwargs):
+        result=original_archive(*args,**kwargs)
+        created.append(result['file'])
+        return result
+    monkeypatch.setattr(export,'archive',counted_archive)
+    def failed(args,**kwargs):
+        return SimpleNamespace(returncode=1,stdout='',stderr='token expired')
+    monkeypatch.setattr(export.subprocess,'run',failed)
+    with pytest.raises(ValueError,match='token expired'):
+        export.upload(version_id,True)
+    assert len(created)==1
+    record=export.retry_record(version_id)
+    assert record.exists()
+    first_file=created[0]
+    def passed(args,**kwargs):
+        if 'lsjson' in args:
+            p=core.DATA/'exports'/Path(args[2]).name
+            return SimpleNamespace(returncode=0,stdout=json.dumps({'Size':p.stat().st_size,'Hashes':{'SHA-256':registry.sha(p)}}),stderr='')
+        return SimpleNamespace(returncode=0,stdout='',stderr='')
+    monkeypatch.setattr(export.subprocess,'run',passed)
+    assert export.upload(version_id,True)['metadata']['file']==first_file
+    assert len(created)==1
+    assert not record.exists()
+
+    monkeypatch.setattr(export.subprocess,'run',failed)
+    with pytest.raises(ValueError,match='token expired'):
+        export.upload(version_id,True)
+    assert len(created)==2
+    manifest_path=core.DATA/'versions'/version_id/'dataset_manifest.json'
+    manifest=json.loads(manifest_path.read_text())
+    manifest['description']='changed after ZIP creation'
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(export.subprocess,'run',passed)
+    assert export.upload(version_id,True)['uploaded']
+    assert len(created)==3
+    assert not record.exists()
+
+    monkeypatch.setattr(export.subprocess,'run',failed)
+    with pytest.raises(ValueError,match='token expired'):
+        export.upload(version_id,True)
+    assert len(created)==4
+    (core.DATA/'exports'/created[-1]).write_bytes(b'corrupt')
+    monkeypatch.setattr(export.subprocess,'run',passed)
+    assert export.upload(version_id,True)['uploaded']
+    assert len(created)==5
+    assert not record.exists()
+
+def test_drive_upload_recovers_zip_without_retry_record(root,monkeypatch):
+    from types import SimpleNamespace
+    register(yolo(root,'older_upload',4),'older_upload','real')
+    review('older_upload')
+    version_id=versions.create(test_real=1,val_ratio=.4,seed=3)['id']
+    older=export.archive(version_id,False)
+    monkeypatch.setattr(export,'setup',lambda:{'ready':True})
+    monkeypatch.setattr(export.shutil,'which',lambda x:'/usr/bin/rclone')
+    def should_not_archive(*args,**kwargs):
+        raise AssertionError('既存ZIPを再利用できませんでした')
+    monkeypatch.setattr(export,'archive',should_not_archive)
+    def passed(args,**kwargs):
+        if 'lsjson' in args:
+            p=core.DATA/'exports'/Path(args[2]).name
+            return SimpleNamespace(returncode=0,stdout=json.dumps({'Size':p.stat().st_size,'Hashes':{'SHA-256':registry.sha(p)}}),stderr='')
+        return SimpleNamespace(returncode=0,stdout='',stderr='')
+    monkeypatch.setattr(export.subprocess,'run',passed)
+    assert export.upload(version_id,True)['metadata']['file']==older['file']
+    assert not export.retry_record(version_id).exists()
 
 def test_merged_to_complete_and_completed_import(root):
     import shutil
